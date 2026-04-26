@@ -1,0 +1,57 @@
+name = "picture-distributor"
+main = "worker/index.js"
+compatibility_date = "2026-04-19"
+workers_dev = true
+routes = [
+  { pattern = "distribute.aryuki.com", custom_domain = true }
+]
+
+[vars]
+PUBLIC_APP_ORIGIN = "https://distribute.aryuki.com"
+PUBLIC_R2_BASE_URL = ""
+APP_ID = "picture-distributor"
+AUTH_CENTER_ORIGIN = "https://accounts.aryuki.com"
+ADMIN_USERNAMES = "admin"
+VECTOR_DIMENSIONS = "512"
+VECTOR_TOP_K = "48"
+VECTOR_MATCH_THRESHOLD = "0.78"
+ALIBABA_ENDPOINT = "https://facebody.cn-shanghai.aliyuncs.com"
+ALIBABA_REGION_ID = "cn-shanghai"
+ALIBABA_DB_NAME = "default"
+ALIBABA_API_VERSION = "2019-12-30"
+ALIBABA_SEARCH_LIMIT = "12"
+ALIBABA_SCORE_THRESHOLD = "0.60"
+ALIBABA_CONFIDENCE_THRESHOLD = "72.62"
+ALIBABA_MAX_FACES = "1"
+ALIBABA_QUALITY_SCORE_THRESHOLD = "50"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "picture-distributor-db"
+database_id = "b54a3c30-327e-4e07-81bb-303caf1dff7f"
+
+[[r2_buckets]]
+binding = "PHOTO_BUCKET"
+bucket_name = "picture-distributor-save"
+
+[[queues.producers]]
+binding = "INGEST_QUEUE"
+queue = "ingest-queue"
+
+[[queues.producers]]
+binding = "SEARCH_QUEUE"
+queue = "search-queue"
+
+[[queues.consumers]]
+queue = "ingest-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+
+[[queues.consumers]]
+queue = "search-queue"
+max_batch_size = 1
+max_batch_timeout = 5
+
+[[vectorize]]
+binding = "PHOTO_VECTOR_INDEX"
+index_name = "picture-distributor-vector"
