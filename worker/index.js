@@ -1,4 +1,4 @@
-import { renderHomePage } from "./homepage3.js";
+import { renderLandingPage, renderDashboardPage } from "./homepage5.js";
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -20,7 +20,15 @@ export default {
 
     try {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/login")) {
-        return htmlResponse(renderHomePage());
+        return htmlResponse(renderLandingPage());
+      }
+
+      if (request.method === "GET" && url.pathname === "/admin") {
+        return htmlResponse(renderDashboardPage("admin"));
+      }
+
+      if (request.method === "GET" && url.pathname === "/user") {
+        return htmlResponse(renderDashboardPage("user"));
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/sso-callback")) {
@@ -245,7 +253,8 @@ async function handleMe(request, env) {
 async function handleLoginUrl(request, env) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") === "bind" ? "bind" : "admin";
-  const callback = `${url.origin}/sso-callback/${mode}`;
+  const next = normalizeAppPath(url.searchParams.get("next"), mode === "admin" ? "/admin" : "/user");
+  const callback = `${url.origin}/sso-callback/${mode}?next=${encodeURIComponent(next)}`;
   const loginUrl = `${getAuthOrigin(env)}/?client_id=${encodeURIComponent(getAppId(env))}&redirect=${encodeURIComponent(callback)}`;
 
   return jsonResponse({ url: loginUrl });
@@ -289,6 +298,7 @@ async function handleSsoCallback(request, env) {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
   const mode = url.pathname.endsWith("/bind") || url.searchParams.get("mode") === "bind" ? "bind" : "admin";
+  const next = normalizeAppPath(url.searchParams.get("next"), mode === "admin" ? "/admin" : "/user");
 
   if (!token) {
     return htmlResponse("<h1>Missing token</h1>", 400);
@@ -332,7 +342,7 @@ async function handleSsoCallback(request, env) {
   return new Response(null, {
     status: 302,
     headers: {
-      location: "/",
+      location: next,
       "set-cookie": sessionCookie(sid),
     },
   });
@@ -347,7 +357,25 @@ async function handleListClasses(request, env) {
       "GROUP BY c.id, c.name, c.is_open ORDER BY c.created_at DESC"
   ).all();
 
-  return jsonResponse({ classes: rows.results || [] });
+  const previewRows = await env.DB.prepare(
+    "SELECT class_id, id FROM (" +
+      "SELECT class_id, id, ROW_NUMBER() OVER (PARTITION BY class_id ORDER BY created_at DESC) AS rn FROM photos" +
+    ") WHERE rn <= 3"
+  ).all();
+
+  const previewsByClass = new Map();
+  for (const row of previewRows.results || []) {
+    const list = previewsByClass.get(row.class_id) || [];
+    list.push(buildPhotoFileUrl(row.id));
+    previewsByClass.set(row.class_id, list);
+  }
+
+  return jsonResponse({
+    classes: (rows.results || []).map((item) => ({
+      ...item,
+      preview_urls: previewsByClass.get(item.id) || [],
+    })),
+  });
 }
 
 async function handleCreateClass(request, env) {
@@ -1121,6 +1149,12 @@ function publicUser(user) {
     avatarUrl: user.avatar_url,
     authCenterUrl: user.auth_uuid ? `${getStaticAuthOrigin()}/${user.auth_uuid}` : "",
   };
+}
+
+function normalizeAppPath(value, fallback = "/") {
+  const allowed = new Set(["/", "/admin", "/user"]);
+  const next = String(value || fallback || "/").trim();
+  return allowed.has(next) ? next : fallback;
 }
 
 function getAppId(env) {
