@@ -1,4 +1,6 @@
-import { renderLandingPage, renderDashboardPage } from "./homepage5.js";
+import { renderHomePage } from "./homepage3.js";
+import { renderClassSearchPage } from "./searchpage.js";
+import { renderQueryHistoryPage } from "./historypage.js";
 
 const corsHeaders = {
   "access-control-allow-origin": "*",
@@ -20,15 +22,15 @@ export default {
 
     try {
       if (request.method === "GET" && (url.pathname === "/" || url.pathname === "/login")) {
-        return htmlResponse(renderLandingPage());
+        return htmlResponse(renderHomePage());
       }
 
-      if (request.method === "GET" && url.pathname === "/admin") {
-        return htmlResponse(renderDashboardPage("admin"));
+      if (request.method === "GET" && url.pathname === "/search") {
+        return htmlResponse(renderClassSearchPage());
       }
 
-      if (request.method === "GET" && url.pathname === "/user") {
-        return htmlResponse(renderDashboardPage("user"));
+      if (request.method === "GET" && url.pathname === "/history") {
+        return htmlResponse(renderQueryHistoryPage());
       }
 
       if (request.method === "GET" && url.pathname.startsWith("/sso-callback")) {
@@ -53,6 +55,26 @@ export default {
 
       if (request.method === "GET" && url.pathname === "/api/classes") {
         return withCors(await handleListClasses(request, env));
+      }
+
+      if (request.method === "GET" && url.pathname === "/api/class-search") {
+        return withCors(await handleClassNameSearch(request, env));
+      }
+
+      if (url.pathname === "/api/class-search-history" && request.method === "GET") {
+        return withCors(await handleClassSearchHistory(request, env));
+      }
+
+      if (url.pathname === "/api/class-search-history" && request.method === "POST") {
+        return withCors(await handleSaveClassSearch(request, env));
+      }
+
+      if (url.pathname === "/api/query-history" && request.method === "GET") {
+        return withCors(await handleQueryHistory(request, env));
+      }
+
+      if (url.pathname.startsWith("/api/query-history/") && request.method === "DELETE") {
+        return withCors(await handleDeleteQueryHistory(request, env, url.pathname.slice("/api/query-history/".length)));
       }
 
       if (request.method === "POST" && url.pathname === "/api/classes") {
@@ -206,6 +228,15 @@ async function handleSearchUpload(request, env) {
   if (!(selfie instanceof File)) {
     return jsonResponse({ error: "A selfie file is required" }, 400);
   }
+  if (!String(selfie.type || "").toLowerCase().startsWith("image/")) {
+    return jsonResponse({ error: "The selfie must be an image file" }, 415);
+  }
+  if (!selfie.size) {
+    return jsonResponse({ error: "The selfie image is empty" }, 400);
+  }
+  if (selfie.size > 10 * 1024 * 1024) {
+    return jsonResponse({ error: "The selfie must be 10 MB or smaller" }, 413);
+  }
 
   const taskId = crypto.randomUUID();
   const objectKey = buildObjectKey("selfies", selfie.name, taskId);
@@ -253,8 +284,7 @@ async function handleMe(request, env) {
 async function handleLoginUrl(request, env) {
   const url = new URL(request.url);
   const mode = url.searchParams.get("mode") === "bind" ? "bind" : "admin";
-  const next = normalizeAppPath(url.searchParams.get("next"), mode === "admin" ? "/admin" : "/user");
-  const callback = `${url.origin}/sso-callback/${mode}?next=${encodeURIComponent(next)}`;
+  const callback = `${url.origin}/sso-callback/${mode}`;
   const loginUrl = `${getAuthOrigin(env)}/?client_id=${encodeURIComponent(getAppId(env))}&redirect=${encodeURIComponent(callback)}`;
 
   return jsonResponse({ url: loginUrl });
@@ -298,7 +328,6 @@ async function handleSsoCallback(request, env) {
   const url = new URL(request.url);
   const token = url.searchParams.get("token");
   const mode = url.pathname.endsWith("/bind") || url.searchParams.get("mode") === "bind" ? "bind" : "admin";
-  const next = normalizeAppPath(url.searchParams.get("next"), mode === "admin" ? "/admin" : "/user");
 
   if (!token) {
     return htmlResponse("<h1>Missing token</h1>", 400);
@@ -342,7 +371,7 @@ async function handleSsoCallback(request, env) {
   return new Response(null, {
     status: 302,
     headers: {
-      location: next,
+      location: "/",
       "set-cookie": sessionCookie(sid),
     },
   });
@@ -357,25 +386,136 @@ async function handleListClasses(request, env) {
       "GROUP BY c.id, c.name, c.is_open ORDER BY c.created_at DESC"
   ).all();
 
-  const previewRows = await env.DB.prepare(
-    "SELECT class_id, id FROM (" +
-      "SELECT class_id, id, ROW_NUMBER() OVER (PARTITION BY class_id ORDER BY created_at DESC) AS rn FROM photos" +
-    ") WHERE rn <= 3"
-  ).all();
+  return jsonResponse({ classes: rows.results || [] });
+}
 
-  const previewsByClass = new Map();
-  for (const row of previewRows.results || []) {
-    const list = previewsByClass.get(row.class_id) || [];
-    list.push(buildPhotoFileUrl(row.id));
-    previewsByClass.set(row.class_id, list);
+async function handleClassNameSearch(request, env) {
+  const user = await requireUser(request, env);
+  const query = new URL(request.url).searchParams.get("q")?.trim().slice(0, 80) || "";
+  if (!query) {
+    return jsonResponse({ classes: [] });
   }
 
-  return jsonResponse({
-    classes: (rows.results || []).map((item) => ({
-      ...item,
-      preview_urls: previewsByClass.get(item.id) || [],
+  const classRows = await env.DB.prepare(
+    "SELECT id, name FROM photo_classes WHERE is_open = 1 ORDER BY name COLLATE NOCASE ASC"
+  ).all();
+  const ranked = (classRows.results || [])
+    .map((item) => ({ ...item, relevance: classNameRelevance(item.name, query) }))
+    .filter((item) => item.relevance > 0)
+    .sort((left, right) => right.relevance - left.relevance || left.name.localeCompare(right.name))
+    .slice(0, 30);
+
+  if (!ranked.length) {
+    await recordClassSearchResult(user, query, [], env);
+    return jsonResponse({ query, classes: [] });
+  }
+
+  const photoResults = await env.DB.batch(
+    ranked.map((item) => env.DB.prepare(
+      "SELECT id, original_name, content_type, size_bytes FROM photos WHERE class_id = ?1 AND status = 'indexed' ORDER BY created_at DESC"
+    ).bind(item.id))
+  );
+  const classes = ranked.map((item, index) => ({
+    id: item.id,
+    name: item.name,
+    photos: (photoResults[index]?.results || []).map((photo) => ({
+      id: photo.id,
+      name: photo.original_name || photo.id,
+      contentType: photo.content_type,
+      sizeBytes: photo.size_bytes,
+      url: buildPhotoFileUrl(photo.id),
     })),
-  });
+  }));
+  if (user.auth_uuid || user.role === "admin") {
+    const photoIds = classes.flatMap((item) => item.photos.map((photo) => photo.id));
+    await recordClassSearchResult(user, query, photoIds, env);
+  }
+  return jsonResponse({ query, classes });
+}
+
+async function recordClassSearchResult(user, query, photoIds, env) {
+  if (!user.auth_uuid && user.role !== "admin") return;
+  await env.DB.prepare(
+    "INSERT INTO class_search_history (id, user_id, query, result_count, matched_photo_ids) VALUES (?1, ?2, ?3, ?4, ?5)"
+  ).bind(crypto.randomUUID(), user.id, query, photoIds.length, JSON.stringify(photoIds)).run();
+}
+
+async function handleClassSearchHistory(request, env) {
+  const user = await requireUser(request, env);
+  if (!user.auth_uuid && user.role !== "admin") return jsonResponse({ synced: false, queries: [] });
+  const rows = await env.DB.prepare(
+    "SELECT query, MAX(created_at) AS last_used FROM class_search_history WHERE user_id = ?1 GROUP BY query ORDER BY last_used DESC LIMIT 8"
+  ).bind(user.id).all();
+  return jsonResponse({ synced: true, queries: (rows.results || []).map((row) => row.query) });
+}
+
+async function handleSaveClassSearch(request, env) {
+  const user = await requireUser(request, env);
+  const body = await safeJson(request);
+  const query = String(body.query || "").trim().slice(0, 80);
+  if (!query) return jsonResponse({ saved: false });
+  if (!user.auth_uuid && user.role !== "admin") return jsonResponse({ saved: false, synced: false });
+  await env.DB.prepare("DELETE FROM class_search_history WHERE user_id = ?1 AND query = ?2").bind(user.id, query).run();
+  await env.DB.prepare("INSERT INTO class_search_history (id, user_id, query) VALUES (?1, ?2, ?3)").bind(crypto.randomUUID(), user.id, query).run();
+  return jsonResponse({ saved: true, synced: true });
+}
+
+async function handleQueryHistory(request, env) {
+  const user = await requireUser(request, env);
+  if (!user.auth_uuid && user.role !== "admin") return jsonResponse({ synced: false, records: [] });
+  const rows = await env.DB.prepare(
+    "SELECT id, query, result_count, matched_photo_ids, created_at FROM class_search_history WHERE user_id = ?1 ORDER BY created_at DESC LIMIT 50"
+  ).bind(user.id).all();
+  const records = [];
+  for (const row of rows.results || []) {
+    const ids = parseJsonArray(row.matched_photo_ids).slice(0, 80);
+    const states = ids.length ? await env.DB.batch(ids.map((id) => env.DB.prepare(
+      "SELECT p.id, p.original_name, p.status, c.is_open FROM photos p LEFT JOIN photo_classes c ON c.id = p.class_id WHERE p.id = ?1 LIMIT 1"
+    ).bind(id))) : [];
+    records.push({
+      id: row.id,
+      query: row.query,
+      resultCount: Number(row.result_count || ids.length),
+      createdAt: row.created_at,
+      photos: ids.map((id, index) => {
+        const photo = states[index]?.results?.[0];
+        const available = !!photo && photo.status === "indexed" && photo.is_open === 1;
+        return { id, name: photo?.original_name || "Image unavailable", available, url: available ? buildPhotoFileUrl(id) : null };
+      }),
+    });
+  }
+  return jsonResponse({ synced: true, records });
+}
+
+async function handleDeleteQueryHistory(request, env, historyId) {
+  const user = await requireUser(request, env);
+  if (!user.auth_uuid && user.role !== "admin") return jsonResponse({ error: "Online history is not enabled" }, 403);
+  const row = await env.DB.prepare("SELECT id FROM class_search_history WHERE id = ?1 AND user_id = ?2 LIMIT 1").bind(historyId, user.id).first();
+  if (!row) return jsonResponse({ error: "History record not found" }, 404);
+  await env.DB.prepare("DELETE FROM class_search_history WHERE id = ?1 AND user_id = ?2").bind(historyId, user.id).run();
+  return jsonResponse({ deleted: true });
+}
+
+function classNameRelevance(name, query) {
+  const normalize = (value) => String(value || "").normalize("NFKC").toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim();
+  const target = normalize(name);
+  const phrase = normalize(query);
+  if (!target || !phrase) return 0;
+  if (target === phrase) return 1000;
+  if (target.startsWith(phrase)) return 850 - Math.min(100, target.length - phrase.length);
+  if (target.includes(phrase)) return 700 - Math.min(100, target.indexOf(phrase));
+  const targetWords = target.split(/\s+/);
+  const terms = [...new Set(phrase.split(/\s+/).filter(Boolean))];
+  let score = 0;
+  let matched = 0;
+  for (const term of terms) {
+    if (targetWords.includes(term)) { score += 120; matched += 1; continue; }
+    if (targetWords.some((word) => word.startsWith(term))) { score += 80; matched += 1; continue; }
+    if (target.includes(term)) { score += 45; matched += 1; }
+  }
+  if (!matched) return 0;
+  if (matched === terms.length) score += 250;
+  return score + Math.round((matched / terms.length) * 100);
 }
 
 async function handleCreateClass(request, env) {
@@ -1149,12 +1289,6 @@ function publicUser(user) {
     avatarUrl: user.avatar_url,
     authCenterUrl: user.auth_uuid ? `${getStaticAuthOrigin()}/${user.auth_uuid}` : "",
   };
-}
-
-function normalizeAppPath(value, fallback = "/") {
-  const allowed = new Set(["/", "/admin", "/user"]);
-  const next = String(value || fallback || "/").trim();
-  return allowed.has(next) ? next : fallback;
 }
 
 function getAppId(env) {

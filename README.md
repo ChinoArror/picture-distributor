@@ -7,8 +7,11 @@ PhotoFinder is a Cloudflare-first photo distribution system for event photograph
 - Face indexing and face search with Alibaba Cloud Facebody
 - Public or private class visibility control
 - Temporary guest users, Auth Center binding, and admin login
-- Search history for bound users
+- Synchronized query history for bound users/admins and cookie history for temporary users
 - Full-size image preview, selection, direct download, and ZIP download
+- Open-class name search with relevance ranking at `/search`
+- Responsive desktop/mobile camera capture and layouts
+- Responsive history page at `/history`
 
 The current production domain is:
 
@@ -91,18 +94,22 @@ Users can:
 - select results
 - download selected originals directly
 - download selected results as ZIP
+- search open classes by name from the compact header search box
+- browse matching classes and choose a full class or individual photos
+- open History directly from the main header on desktop or mobile
 
-### 3.3 Bound User / Admin History
+### 3.3 Query History
 
-Users who are bound to Aryuki Auth Center, plus admins, can:
+Users bound to Aryuki Auth Center, plus admins, receive server-side D1 history synchronization. Each class-name query stores its time, result count, and matched photo IDs. `/history` resolves those IDs against current data:
 
-- open the History panel
-- see when a search was run
-- see which selfie was used
-- see which photos were matched
-- directly download historical matches
+- available photos link to the original file
+- deleted photos, non-indexed photos, and photos in closed/deleted classes render as gray unavailable placeholders
+- no duplicate image files are stored for history
+- history entries can be deleted after a custom confirmation dialog
 
-Temporary users do not have access to history until they bind an Auth Center account.
+Temporary/unbound users keep class-query history in a one-year cookie. Cookie records contain only query text, time, and result count; the history page deliberately does not show thumbnails for those records.
+
+Face-search task history remains available to bound accounts in the main application's History panel.
 
 ## 4. Repository Layout
 
@@ -112,8 +119,12 @@ Main files:
 - [schema.sql](/D:/Code/picture-distributor/schema.sql): base D1 schema
 - [migrate-auth-classes.sql](/D:/Code/picture-distributor/migrate-auth-classes.sql): earlier schema migration
 - [migrate-search-history.sql](/D:/Code/picture-distributor/migrate-search-history.sql): search history migration
+- [migrate-class-search-history.sql](/D:/Code/picture-distributor/migrate-class-search-history.sql): class-query history table
+- [migrate-class-search-results.sql](/D:/Code/picture-distributor/migrate-class-search-results.sql): query result count and photo reference migration
 - [worker/index.js](/D:/Code/picture-distributor/worker/index.js): API routes + queue consumers
 - [worker/homepage3.js](/D:/Code/picture-distributor/worker/homepage3.js): current inlined frontend
+- [worker/searchpage.js](/D:/Code/picture-distributor/worker/searchpage.js): `/search` result page
+- [worker/historypage.js](/D:/Code/picture-distributor/worker/historypage.js): `/history` query history page
 - [.gitignore](/D:/Code/picture-distributor/.gitignore): local ignore rules
 
 Legacy / not actively used in production:
@@ -339,6 +350,11 @@ Key UI behavior:
 - login page is the default entry
 - admin panel is hidden for non-admin users
 - search panel is always available after login
+- the header always shows a History button, compact class search, and the current username
+- pointer/hover capability detection selects either desktop camera capture or the mobile front-camera file capture; no user-agent sniffing is used
+- `/search` ranks only open classes by exact, prefix, phrase, and token matches
+- all layouts prevent horizontal overflow and adapt to the viewport
+- destructive actions use a custom modal: centered on desktop, bottom-sheet animation on mobile, with background scroll locked
 - temporary users can bind Auth Center later
 - thumbnails use Cloudflare Image Resizing path first
 - if thumbnail load fails, the image falls back to the original photo URL
@@ -398,24 +414,14 @@ Deleting a class will:
 
 The UI requires a confirmation dialog before destructive actions.
 
-## 14. Search History
+## 14. History
 
-History is intentionally restricted.
+There are two related history surfaces:
 
-Accessible only when:
+- The main-page face-search History panel is available to bound users and includes selfie/task status, matched photos, direct download, and ZIP download.
+- `/history` records class-name queries. Bound users and admins synchronize these records through D1; temporary users store text/time/count-only records in cookies.
 
-- the current user is bound to Auth Center, or
-- the current user is an admin with Auth Center identity
-
-History includes:
-
-- selfie thumbnail
-- original selfie filename
-- creation time
-- task status
-- matched photos
-- direct download
-- ZIP download
+Online class-query records reference original photo IDs. The history page does not store copied image files. If an original photo is deleted, no longer indexed, or its class is closed/deleted, its thumbnail becomes a non-clickable gray unavailable tile. Both online and cookie history entries can be deleted through the custom confirmation modal.
 
 ## 15. Thumbnail Strategy
 
