@@ -10,10 +10,9 @@ administrator console.
 
 Production origin: `https://distribute.aryuki.com`
 
-This document describes the code currently present in this repository. The
-three-tier `originals / previews / thumbnails` delivery model is documented
-separately as a planned migration and must not be mistaken for deployed
-behavior.
+This document describes the code currently present in this repository,
+including the queue-generated `originals / previews / thumbnails` delivery
+model and its upload-usage administration.
 
 ## Product principles
 
@@ -25,8 +24,8 @@ behavior.
   than copies.
 - Every protected read is authorized by the Worker before an R2 object is
   returned.
-- Long-running face, save, deletion, and storage migration work is queue-driven
-  and safe to retry.
+- Long-running face, image-variant, save, deletion, and storage migration work
+  is queue-driven and safe to retry.
 - User identity, role assignment, and quota are bound to the stable Auth Center
   UUID, not to a display name or username.
 - Desktop and mobile use the same design system, with dedicated responsive
@@ -46,6 +45,7 @@ behavior.
 | `/account` | Identity, Auth Center binding, theme/background settings, and Bing daily background mode |
 | `/admin` | System overview |
 | `/admin/classes` | All classes, owners, counts, bytes, visibility, photo expansion, and force deletion |
+| `/admin/uploads` | Upload usage by user, daily filtering, processing status, file bytes, and the Images processing switch |
 | `/admin/users` | Users, stable identity, role assignment, effective permission, and usage |
 | `/admin/roles` | Role CRUD, default role, access mode, and quota |
 | `/admin/audit` | Actions grouped by user, including target, UUID, IP, country code, and sensitivity |
@@ -131,7 +131,7 @@ flowchart LR
   Worker --> Assets["Static Assets"]
   Worker --> D1["D1 metadata and authority"]
   Worker --> KV["KV public-class candidate cache"]
-  Worker --> R2["Private R2 originals and temporary inputs"]
+  Worker --> R2["Private R2 originals, derivatives, and temporary inputs"]
   Worker --> Images["Cloudflare Images transform binding"]
   Worker --> IQ["INGEST_QUEUE"]
   Worker --> SQ["SEARCH_QUEUE"]
@@ -149,11 +149,11 @@ flowchart LR
 |---|---|
 | Browser SPA | Routing, localized UI, camera/file input, selection, progress, dialogs, and polling |
 | Worker fetch handler | Session validation, authorization, APIs, R2 streaming, static security headers, and queue production |
-| Worker queue handler | Face ingestion/search, pointer saves, audit writes, deletion, ownership transfer, and R2 rekey jobs |
+| Worker queue handler | Face ingestion/search, preview/thumbnail generation, pointer saves, audit writes, deletion, ownership transfer, and R2 rekey jobs |
 | D1 | All durable metadata and authorization state |
-| R2 | Original photos, temporary selfies, and custom background files |
+| R2 | Original photos, generated previews/thumbnails, temporary selfies, and custom background files |
 | KV | Five-minute cache of public class candidate IDs, names, and creation times |
-| Images binding | On-demand 520 px WebP thumbnail generation |
+| Images binding | Queue-driven WebP preview and thumbnail generation |
 | Alibaba Facebody | Face entity index and similarity search |
 | Cron | Five-minute recovery, retry enqueueing, and expired-data cleanup |
 
@@ -241,13 +241,18 @@ checks the byte signature instead of trusting the filename or declared MIME
 type. JPEG, PNG, WebP, GIF, AVIF, HEIC, and HEIF are accepted; active SVG input
 is rejected.
 
+`photos.original_name` and the upload log use the browser-provided `File.name`.
+This normally preserves the filename exposed by the device photo picker. A
+browser may replace or synthesize that name for privacy; web code cannot read a
+different internal album title when it is not provided.
+
 Metadata extraction reads at most the first 512 KiB:
 
 - JPEG: dimensions and selected EXIF values;
 - PNG and GIF: dimensions;
 - extended WebP: dimensions.
 
-## IDs and current R2 layout
+## IDs, content IDs, and R2 layout
 
 New IDs have a typed lowercase prefix plus a 16-character base64url body
 generated from 12 cryptographically secure random bytes:
@@ -258,88 +263,71 @@ p_e2P5CHFMf7pPM2y_
 ```
 
 The random body is 96 bits. Common prefixes include `u_`, `c_`, `p_`, `task_`,
-`hist_`, `bg_`, `save_`, `link_`, `role_`, `job_`, `audit_`, and `ses_`.
+`hist_`, `bg_`, `save_`, `link_`, `role_`, `job_`, `audit_`, `up_`, and `ses_`.
 `c_past000000000000` is the single fixed legacy migration exception.
 
-Current R2 keys:
+Every new photo also receives a fixed content ID: the lowercase 32-character
+hexadecimal MD5 digest of the original bytes. The same content ID is used in
+all three stored filenames:
 
 ```text
-<class-id>/<photo-id>.<normalized-extension>
+p_or_<content-id>.<normalized-extension>
+p_pr_<content-id>.webp
+p_th_<content-id>.webp
+```
+
+New photo keys use the following private-R2 layout:
+
+```text
+originals/<class-id>/p_or_<content-id>.<normalized-extension>
+previews/<class-id>/p_pr_<content-id>.webp
+thumbnails/<class-id>/p_th_<content-id>.webp
 temp/selfies/<task-id>.<normalized-extension>
 backgrounds/<user-id>/<background-id>-original.<extension>
 backgrounds/<user-id>/<background-id>-cropped.<extension>
 ```
 
-The database `r2_key` is authoritative. Existing object keys must never be
-derived from IDs because legacy objects may still use older paths.
+`photos.r2_key` and `photo_upload_records` remain authoritative. Existing
+objects retain their historical keys and filenames; this change does not rename
+or move them. MD5 is only a storage content ID, never a password, session, or
+authorization primitive.
 
-## Current image delivery behavior
+## Three-tier image processing and delivery
 
 This is the implemented behavior as of this repository state:
 
-1. `/api/photos/:id/thumbnail` loads the authorized original from private R2.
-2. When the `IMAGES` binding is available, the Worker creates a 520 px,
-   quality-74 WebP response on demand.
-3. Public thumbnails use
-   `public, max-age=3600, stale-while-revalidate=86400`.
-4. Protected thumbnails use `private, max-age=300`.
-5. If transformation fails or the binding is absent, the endpoint falls back
-   to the authorized original.
-6. `/api/photos/:id/file` streams the original and supports byte ranges.
-7. Public originals use a short 60-second revalidation cache; protected
-   originals use `private, no-store`.
+1. The upload request validates the image and stores the original.
+2. It always writes one `photo_upload_records` row with uploader snapshots,
+   filenames, keys, original bytes, total bytes, time, and processing state.
+   Original naming is always `p_or_<md5>.<extension>`, even when Images
+   processing is disabled.
+3. When Images processing is enabled, `photo.variants` is sent to
+   `INGEST_QUEUE`. The consumer creates a width-1600 quality-84 WebP preview and
+   a width-520 quality-74 WebP thumbnail.
+4. Queue state is `queued`, `processing`, `completed`, `decline`, or `error`.
+   Disabling processing makes new records `decline`; transform failures become
+   `error`.
+5. `/api/photos/:id/thumbnail` and `/api/photos/:id/preview` authorize the
+   current request before an internal Edge Cache lookup. The outward response
+   is always `private, no-store`.
+6. Edge Cache contains only derivative bytes, never a user/session decision.
+   A cached derivative cannot bypass a later permission or visibility check.
+7. If a derivative is unavailable, the authorized original is returned.
+   `/api/photos/:id/file` always returns the original and supports byte ranges.
+8. Public-share thumbnails repeat the active-link, password-session, owner, and
+   selected-content checks before the same private derivative path is used.
+9. Physical deletion removes original, preview, and thumbnail objects.
+   Pointer-based ownership transfer retains all three because the photo remains
+   valid.
 
-Generated preview and thumbnail objects are **not currently stored** in R2.
-The public share gallery also currently uses its authorized original-file route
-as the thumbnail URL. Both are migration targets.
+Existing photos are backfilled into the upload log as `decline` without moving
+their R2 objects or claiming a transformation. They continue to use the
+authorized-original fallback. A future bounded backfill may generate their
+derivatives, but it must not change any read, save, edit, or share permission.
 
-## Planned three-tier image delivery
-
-The proposed private-R2 layout is reasonable and fits the existing authority
-model:
-
-```text
-originals/<class-id>/<photo-id>.<extension>
-previews/<class-id>/<photo-id>/<variant-version>.webp
-thumbnails/<class-id>/<photo-id>/<variant-version>.webp
-temp/...
-backgrounds/...
-```
-
-Planned invariants:
-
-- Originals remain immutable and are returned only for lightbox viewing or
-  download.
-- Thumbnail and preview bytes are generated after upload by a queue consumer.
-- D1 stores original and variant keys, dimensions, format, byte size, version,
-  and generation status.
-- Every request performs D1 authorization before checking Edge Cache or R2.
-- Edge Cache stores only derivative bytes. It never stores or reuses an
-  authorization decision.
-- The cache key includes photo ID, variant, and immutable version/ETag so
-  replacement cannot serve stale content.
-- A `public` to `private` visibility change does not expose cached bytes because
-  the Worker remains the only route to private R2 and authorizes before cache
-  lookup.
-- Deletion removes all variants; pointer-based ownership transfer keeps them
-  because the underlying photo remains the same.
-- The current on-demand endpoint remains a fallback until backfill is complete.
-
-Recommended rollout:
-
-1. Add an `image_variants` table or equivalent columns without changing reads.
-2. Update upload ingestion to generate thumbnail and preview variants.
-3. Add versioned internal cache keys and authorization-first delivery helpers.
-4. Backfill active photos in bounded queue batches.
-5. Switch gallery surfaces to thumbnails and lightboxes to previews, retaining
-   originals for download and an explicit original-view action.
-6. Update public shares to use the same derivative endpoints.
-7. Measure cache hit rate, transformation failures, R2 reads, and variant bytes.
-8. Remove on-demand transformation only after the backfill and fallback metrics
-   are clean.
-
-This adds two small derivative objects per photo, so it trades modest R2 object
-count and storage for lower repeated transform cost and faster gallery loads.
+Only original bytes participate in the user role quota. Derivative bytes are
+system usage recorded in the upload log and administrator totals; they are not
+silently charged to the uploader.
 
 ## Save pointers and deletion semantics
 
@@ -396,6 +384,7 @@ Passwords:
 `INGEST_QUEUE` message types:
 
 - `photo.ingest`
+- `photo.variants`
 - `face.delete`
 - `storage.delete`
 - `storage.rekey`
@@ -410,8 +399,8 @@ the durable source of truth.
 
 Every five minutes Cron:
 
-- returns indexing, search, or deletion claims stale for 15 minutes to a
-  retryable state;
+- returns indexing, image-processing, search, or deletion claims stale for 15
+  minutes to a retryable state;
 - re-enqueues pending jobs;
 - removes completed/failed selfie inputs after 24 hours, with a seven-day hard
   limit;
@@ -435,6 +424,10 @@ The administrator console provides:
   photos;
 - user-to-role assignment and effective quota/usage;
 - role creation, editing, deletion, ordering, and default-role selection;
+- upload usage grouped by uploader, with day-accurate date filtering, overall
+  totals, original/derivative bytes, filenames, and queue state;
+- an administrator-only Images processing switch; disabling it records new
+  uploads as `decline`, while failures are retained as `error`;
 - failed face-ingest retry;
 - resumable legacy R2 rekeying;
 - force deletion of a class or photo;
@@ -455,6 +448,8 @@ names may be truncated on small screens but remain copyable in full.
 | `app_sessions` | Opaque application sessions |
 | `photo_classes` | Class name, description, owner, visibility, and deletion state |
 | `photos` | R2 key, owner, class, bytes, metadata, Facebody entity, indexing, and deletion state |
+| `photo_upload_records` | Immutable upload/uploader snapshots, content ID, three object keys, byte totals, timestamps, and Images queue state |
+| `image_processing_settings` | Singleton administrator-controlled Images processing switch |
 | `saved_classes` | User-to-class save pointers |
 | `saved_photos` | User-to-photo save pointers |
 | `deletion_jobs` | Idempotent delete and rekey work |
@@ -497,6 +492,7 @@ GET                /api/history
 DELETE             /api/history/:type/:id
 GET                /api/selfies/:taskId/file
 GET                /api/photos/:id/thumbnail
+GET                /api/photos/:id/preview
 GET                /api/photos/:id/file
 DELETE             /api/photos/:id
 ```
@@ -523,12 +519,16 @@ GET|PATCH|DELETE   /api/share-links/:id
 GET                /api/public/shares/:slug
 POST               /api/public/shares/:slug/unlock
 GET                /api/public/shares/:slug/photos/:photoId/file
+GET                /api/public/shares/:slug/photos/:photoId/thumbnail
 ```
 
 ### Administration
 
 ```text
 GET          /api/admin/overview
+GET          /api/admin/uploads
+GET          /api/admin/uploads/records
+GET|PATCH    /api/admin/image-processing
 GET          /api/admin/classes
 GET          /api/admin/users
 PATCH        /api/admin/users/:id
@@ -675,6 +675,7 @@ Migration history:
 | `0003_own_read_backgrounds.sql` | Adds class descriptions and the initial custom-background/restore table |
 | `0004_background_share_audit.sql` | Adds background mode, encrypted share-password display material, and audit logs |
 | `0005_photo_metadata_audit_targets_email.sql` | Adds email, photo metadata, and audit target details |
+| `0006_image_variants_upload_records.sql` | Adds the Images switch and upload/variant usage records; legacy photos are logged as `decline` without moving objects |
 
 Important upgrade check: the fresh schema supports `own_read`. An existing
 database originally created by migration `0001` may still have the older
@@ -708,12 +709,13 @@ npm run check
 The `node:test` suite currently covers:
 
 - typed 96-bit IDs;
+- deterministic lowercase MD5 photo content IDs;
 - server and browser search syntax;
 - English translations and dynamic counts;
 - image metadata signatures;
 - keyed share-password verification and owner-only encryption;
 - fresh schema/default role behavior;
-- legacy `past` migration;
+- legacy `past` and upload-record migrations;
 - Wrangler assets, KV, recovery, DLQ, and no-Vectorize configuration;
 - optional numeric parameter defaults;
 - raster signature validation and SVG rejection;

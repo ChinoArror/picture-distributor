@@ -44,6 +44,15 @@ export async function request(path, options = {}) {
 
 const id = (value) => encodeURIComponent(String(value));
 const query = (value) => encodeURIComponent(String(value || ""));
+const uploadRangeQuery = (range = {}) => {
+  const params = new URLSearchParams();
+  if (range.all) params.set("all", "1");
+  else {
+    if (range.from) params.set("from", range.from);
+    if (range.to) params.set("to", range.to);
+  }
+  return params.toString();
+};
 
 export const Client = {
   me: () => request("/api/me"),
@@ -124,6 +133,12 @@ export const Client = {
     request(`/api/public/shares/${id(slug)}/unlock`, { method: "POST", json: { password } }),
 
   adminOverview: () => request("/api/admin/overview"),
+  adminUploads: (range = {}) => request(`/api/admin/uploads?${uploadRangeQuery(range)}`),
+  adminUploadRecords: (key, range = {}) =>
+    request(`/api/admin/uploads/records?key=${query(key)}&${uploadRangeQuery(range)}`),
+  imageProcessing: () => request("/api/admin/image-processing"),
+  updateImageProcessing: (enabled) =>
+    request("/api/admin/image-processing", { method: "PATCH", json: { enabled } }),
   adminAudit: () => request("/api/admin/audit"),
   adminClasses: () => request("/api/admin/classes"),
   retryIngest: (limit = 100) =>

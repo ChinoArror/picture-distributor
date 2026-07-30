@@ -141,6 +141,54 @@ CREATE INDEX IF NOT EXISTS idx_photos_class_id
 CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner_user_id, deleted_at, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photos_vector_id ON photos(vector_id);
 
+CREATE TABLE IF NOT EXISTS image_processing_settings (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0, 1)),
+  updated_by_user_id TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (updated_by_user_id) REFERENCES app_users(id) ON DELETE SET NULL
+);
+
+INSERT INTO image_processing_settings (id, enabled)
+VALUES (1, 1)
+ON CONFLICT(id) DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS photo_upload_records (
+  id TEXT PRIMARY KEY,
+  photo_id TEXT UNIQUE,
+  uploader_user_id TEXT,
+  uploader_auth_uuid TEXT NOT NULL DEFAULT '',
+  uploader_name TEXT NOT NULL DEFAULT '',
+  class_id TEXT NOT NULL DEFAULT '',
+  class_name TEXT NOT NULL DEFAULT '',
+  original_filename TEXT NOT NULL,
+  stored_original_name TEXT NOT NULL,
+  content_id TEXT NOT NULL DEFAULT '',
+  original_key TEXT NOT NULL,
+  preview_key TEXT NOT NULL DEFAULT '',
+  thumbnail_key TEXT NOT NULL DEFAULT '',
+  original_bytes INTEGER NOT NULL DEFAULT 0 CHECK (original_bytes >= 0),
+  preview_bytes INTEGER NOT NULL DEFAULT 0 CHECK (preview_bytes >= 0),
+  thumbnail_bytes INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_bytes >= 0),
+  total_bytes INTEGER NOT NULL DEFAULT 0 CHECK (total_bytes >= 0),
+  queue_status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (queue_status IN ('queued', 'processing', 'completed', 'decline', 'error')),
+  error_message TEXT NOT NULL DEFAULT '',
+  uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  processing_started_at TEXT,
+  processed_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE SET NULL,
+  FOREIGN KEY (uploader_user_id) REFERENCES app_users(id) ON DELETE SET NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_photo_upload_records_user_time
+  ON photo_upload_records(uploader_user_id, uploaded_at DESC, id DESC);
+CREATE INDEX IF NOT EXISTS idx_photo_upload_records_status_time
+  ON photo_upload_records(queue_status, uploaded_at DESC);
+CREATE INDEX IF NOT EXISTS idx_photo_upload_records_content
+  ON photo_upload_records(content_id, class_id);
+
 CREATE TABLE IF NOT EXISTS saved_classes (
   user_id TEXT NOT NULL,
   class_id TEXT NOT NULL,

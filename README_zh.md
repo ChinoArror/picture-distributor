@@ -9,9 +9,8 @@ Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebo
 
 生产地址：`https://distribute.aryuki.com`
 
-本文只把仓库中已经实现的功能写成「当前能力」。文末的
-`originals / previews / thumbnails` 三层图片方案属于待实施迁移，不代表当前
-线上已经采用。
+本文只把仓库中已经实现的功能写成「当前能力」，其中包括 Queue 生成的
+`originals / previews / thumbnails` 三层图片以及管理员上传用量记录。
 
 ## 产品原则
 
@@ -20,7 +19,8 @@ Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebo
   唯一真相来源。
 - 每张原图只保存一次；另存和分享只增加引用，不复制原图。
 - 所有受保护图片都必须先由 Worker 根据 D1 鉴权，再读取 R2。
-- 人脸索引、人脸搜索、另存、删除和旧对象搬迁使用 Queue，能够安全重试。
+- 人脸索引、人脸搜索、图片衍生处理、另存、删除和旧对象搬迁使用 Queue，
+  能够安全重试。
 - 用户、角色、权限和空间用量始终绑定 Auth Center 稳定 UUID，不绑定
   显示名或用户名，避免重名导致错配。
 - 电脑端和手机端共用一套设计系统，并分别适配导航、图片网格、弹窗、摄像头
@@ -40,6 +40,7 @@ Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebo
 | `/account` | 身份、Auth Center 绑定、主题、个人背景和 Bing 每日背景 |
 | `/admin` | 管理概览 |
 | `/admin/classes` | 所有类、上传者、张数、大小、公开状态、图片展开和强制删除 |
+| `/admin/uploads` | 按用户查看上传用量、按天筛选、处理状态、文件大小和 Images 处理开关 |
 | `/admin/users` | 用户、稳定身份、角色对应、实际权限和空间用量 |
 | `/admin/roles` | 角色增删改、默认角色、权限模式和空间上限 |
 | `/admin/audit` | 按用户归组的行动记录、对象、UUID、IP、国家码和敏感标记 |
@@ -119,7 +120,7 @@ flowchart LR
   Worker --> Assets["静态资源"]
   Worker --> D1["D1 权限与元数据"]
   Worker --> KV["KV 公开类候选缓存"]
-  Worker --> R2["私有 R2 原图与临时输入"]
+  Worker --> R2["私有 R2 原图、衍生图与临时输入"]
   Worker --> Images["Cloudflare 图片转换绑定"]
   Worker --> IQ["INGEST_QUEUE"]
   Worker --> SQ["SEARCH_QUEUE"]
@@ -137,11 +138,11 @@ flowchart LR
 |---|---|
 | 浏览器 SPA | 前端路由、中英文界面、摄像/文件选择、图片选择、进度、弹窗和任务轮询 |
 | Worker 请求入口 | 会话、鉴权、API、R2 输出、静态安全响应头和发送 Queue |
-| Worker Queue 入口 | 人脸录入/搜索、另存指针、审计写入、删除、上传者转移和旧对象搬迁 |
+| Worker Queue 入口 | 人脸录入/搜索、预览图/缩略图生成、另存指针、审计写入、删除、上传者转移和旧对象搬迁 |
 | D1 | 所有持久元数据和权限状态 |
-| R2 | 原始图片、临时自拍和个人背景文件 |
+| R2 | 原图、生成后的预览图/缩略图、临时自拍和个人背景文件 |
 | KV | 公开类候选 ID、名称和创建时间的 5 分钟缓存 |
-| Images 绑定 | 按需生成 520 px WebP 缩略图 |
+| Images 绑定 | 由 Queue 生成 WebP 预览图和缩略图 |
 | 阿里云 Facebody | 人脸实体索引与搜索 |
 | Cron | 每 5 分钟恢复任务、重新排队和清理过期数据 |
 
@@ -218,13 +219,17 @@ Aryuki Auth Center 是外部身份来源。Worker 验证回传 token 后，只�
 不信任文件名或浏览器声明的类型。支持 JPEG、PNG、WebP、GIF、AVIF、HEIC、
 HEIF；拒绝可执行的 SVG。
 
+`photos.original_name` 和上传记录使用浏览器提供的 `File.name`。通常它就是设备
+相册选择器暴露的存储文件名；若浏览器出于隐私原因替换或临时生成了名称，网页
+无法再读取相册内部未提供的另一个名称。
+
 元数据读取范围限制在文件头 512 KiB：
 
 - JPEG：尺寸与部分 EXIF；
 - PNG、GIF：尺寸；
 - 扩展 WebP：尺寸。
 
-## ID 与当前 R2 目录
+## ID、内容 ID 与 R2 目录
 
 新 ID 使用小写类型前缀，加上由 12 个加密安全随机字节生成的 16 位 base64url
 主体：
@@ -235,76 +240,62 @@ p_e2P5CHFMf7pPM2y_
 ```
 
 随机主体为 96 bit。常见前缀包括 `u_`、`c_`、`p_`、`task_`、`hist_`、
-`bg_`、`save_`、`link_`、`role_`、`job_`、`audit_`、`ses_`。
+`bg_`、`save_`、`link_`、`role_`、`job_`、`audit_`、`up_`、`ses_`。
 `c_past000000000000` 是唯一一个旧数据迁移固定 ID 例外。
 
-当前 R2 key：
+每张新图片还有固定的内容 ID：对原图完整字节计算 MD5，使用 32 位小写十六进制
+结果。三个文件名共用同一个内容 ID：
 
 ```text
-<class-id>/<photo-id>.<规范化扩展名>
-temp/selfies/<task-id>.<规范化扩展名>
-backgrounds/<user-id>/<background-id>-original.<扩展名>
-backgrounds/<user-id>/<background-id>-cropped.<扩展名>
+p_or_<内容-id>.<规范扩展名>
+p_pr_<内容-id>.webp
+p_th_<内容-id>.webp
 ```
 
-必须以数据库 `r2_key` 为准，不能根据 ID 猜已有对象路径，因为旧对象可能仍在
-原路径中。
+新图片使用以下私有 R2 key：
 
-## 当前图片加载方式
+```text
+originals/<类-id>/p_or_<内容-id>.<规范扩展名>
+previews/<类-id>/p_pr_<内容-id>.webp
+thumbnails/<类-id>/p_th_<内容-id>.webp
+temp/selfies/<任务-id>.<规范扩展名>
+backgrounds/<用户-id>/<背景-id>-original.<扩展名>
+backgrounds/<用户-id>/<背景-id>-cropped.<扩展名>
+```
+
+必须以 `photos.r2_key` 和 `photo_upload_records` 为准。旧对象保留原路径，
+不会因这次修改而重命名或移动，也不能根据 ID 猜测。MD5 只作为存储内容 ID，
+不用于密码、会话或权限安全。
+
+## 三层图片处理与加载
 
 以下是本仓库目前已经实现的行为：
 
-1. `/api/photos/:id/thumbnail` 先鉴权，再从私有 R2 读取原图。
-2. 存在 `IMAGES` 绑定时，Worker 按需输出宽 520 px、质量 74 的 WebP。
-3. 公开缩略图缓存策略为
-   `public, max-age=3600, stale-while-revalidate=86400`。
-4. 受保护缩略图为 `private, max-age=300`。
-5. 图片转换失败或没有绑定时，回退到已经鉴权的原图。
-6. `/api/photos/:id/file` 输出原图并支持字节范围。
-7. 公开原图只缓存 60 秒并重新验证；受保护原图为 `private, no-store`。
+1. 上传请求先验证图片并保存原图。
+2. 不论 Images 处理是否开启，都写入一条 `photo_upload_records`，记录上传者
+   快照、原文件名、上传后文件名、三个 key、原图/整体大小、时间和状态。
+   即使关闭 Images 处理，原图仍统一命名为 `p_or_<md5>.<扩展名>`。
+3. 开启 Images 处理后，发送 `photo.variants` 到 `INGEST_QUEUE`。消费者生成
+   宽 1600、质量 84 的 WebP 预览图，以及宽 520、质量 74 的 WebP 缩略图。
+4. 状态只有 `queued`、`processing`、`completed`、`decline`、`error`。
+   关闭处理时新上传写 `decline`；转换异常写 `error`。
+5. `/api/photos/:id/thumbnail` 和 `/api/photos/:id/preview` 必须先判断本次
+   请求权限，之后才查内部 Edge Cache；对浏览器始终返回 `private, no-store`。
+6. Edge Cache 只保存衍生图字节，不保存用户或会话的权限结论。即使已命中缓存，
+   权限或公开状态发生变化后也不能绕过新的鉴权。
+7. 衍生图不存在时回退到已鉴权的原图。`/api/photos/:id/file` 始终输出原图，
+   并支持字节范围。
+8. 公共分享缩略图也会重新检查链接有效期、密码会话、分享所有者和已选内容，
+   然后才走同一条私有衍生图读取路径。
+9. 物理删除会同时删除原图、预览图和缩略图。只发生指针接管时保留三个文件，
+   因为底层图片仍有效。
 
-当前**没有**把生成后的预览图和缩略图保存为 R2 对象。公共分享网格目前也仍把
-经过鉴权的原图接口当作缩略图地址。这两项属于后续迁移目标。
+已有图片只补写一条 `decline` 上传记录，不移动旧 R2 对象，也不声称完成过
+转换；读取时继续回退到已鉴权的原图。以后可以用有上限的 Queue 任务回填衍生图，
+但不能改变任何查看、增删、另存或分享权限。
 
-## 待实施的三层图片方案
-
-将私有 R2 规划为以下结构是合理的，也能保留现有权限模型：
-
-```text
-originals/<class-id>/<photo-id>.<扩展名>
-previews/<class-id>/<photo-id>/<版本>.webp
-thumbnails/<class-id>/<photo-id>/<版本>.webp
-temp/...
-backgrounds/...
-```
-
-计划中的不变量：
-
-- 原图保持不可变，只在大图查看或下载时输出。
-- 缩略图和预览图在上传后由 Queue 消费者生成。
-- D1 记录原图/变体 key、尺寸、格式、字节数、版本和生成状态。
-- 每次请求必须先在 D1 鉴权，再查 Edge Cache 或 R2。
-- Edge Cache 只缓存变体图片字节，不缓存「某用户有权限」这一判断。
-- 缓存 key 包含图片 ID、变体类型和不可变版本/ETag，替换图片不会命中旧内容。
-- 类从 `public` 改为 `private` 后仍不会泄漏缓存，因为私有 R2 只能经过 Worker，
-  且 Worker 在查缓存前先鉴权。
-- 删除图片时同时删除所有变体；仅转移上传者时保留变体，因为底层图片未变。
-- 在全量回填完成前，保留当前按需转换接口作为回退。
-
-建议执行顺序：
-
-1. 先增加 `image_variants` 表或等价字段，不修改现有读取路径。
-2. 在上传索引 Queue 中生成 thumbnail 和 preview。
-3. 实现带版本的内部缓存 key，以及统一的「先鉴权、后缓存」输出函数。
-4. 通过有上限的 Queue 批次为现有有效图片回填变体。
-5. 图片网格改用 thumbnail；大图窗口默认 preview；下载和明确查看原图时才读取
-   original。
-6. 公共分享也改用同一套变体接口。
-7. 监控缓存命中率、转换失败、R2 读取次数和变体占用空间。
-8. 只有回填完成、回退指标稳定后，才考虑移除按需转换。
-
-此方案会让每张照片增加两个体积较小的对象，以少量 R2 对象数和空间换取更少的
-重复转换与更快的图片网格加载。
+用户角色空间只计算原图。预览图和缩略图属于系统处理用量，记录在上传日志和
+管理员统计中，不会暗中计入上传者的个人空间。
 
 ## 「另存到自己」与删除规则
 
@@ -356,6 +347,7 @@ backgrounds/...
 `INGEST_QUEUE` 处理：
 
 - `photo.ingest`
+- `photo.variants`
 - `face.delete`
 - `storage.delete`
 - `storage.rekey`
@@ -369,7 +361,7 @@ backgrounds/...
 
 每 5 分钟 Cron 会：
 
-- 将卡住超过 15 分钟的图片索引、人脸搜索或删除任务恢复为可重试状态；
+- 将卡住超过 15 分钟的图片索引、图片处理、人脸搜索或删除任务恢复为可重试状态；
 - 重新发送待处理任务；
 - 在完成/失败 24 小时后清理自拍输入，最迟不超过 7 天；
 - 临时用户搜索历史保留 7 天；
@@ -388,6 +380,10 @@ backgrounds/...
 - 每个类的上传者、张数、大小、公开状态和可展开图片；
 - 用户和角色对应、实际空间上限与用量；
 - 角色新建、修改、删除、排序和默认角色；
+- 按上传者归组的图片上传用量，支持精确到天的范围筛选、整体统计、原图/衍生图
+  大小、文件名和 Queue 状态；
+- 仅管理员可操作的 Images 处理开关；关闭时新上传记为 `decline`，处理失败保留
+  为 `error`；
 - 重新发送失败的人脸索引；
 - 可恢复的旧 R2 key 搬迁；
 - 强制删除类或图片；
@@ -407,6 +403,8 @@ UUID、行动名、IP、二字国家码、敏感标记、对象类型/ID/名称/
 | `app_sessions` | 本应用不透明会话 |
 | `photo_classes` | 类名称、介绍、上传者、公开状态和删除状态 |
 | `photos` | R2 key、上传者、所属类、大小、元数据、人脸实体、索引和删除状态 |
+| `photo_upload_records` | 上传者快照、内容 ID、三个对象 key、大小、时间和 Images Queue 状态 |
+| `image_processing_settings` | 管理员控制的单例 Images 处理开关 |
 | `saved_classes` | 用户到类的另存指针 |
 | `saved_photos` | 用户到图片的另存指针 |
 | `deletion_jobs` | 幂等删除与对象搬迁任务 |
@@ -449,6 +447,7 @@ GET                /api/history
 DELETE             /api/history/:type/:id
 GET                /api/selfies/:taskId/file
 GET                /api/photos/:id/thumbnail
+GET                /api/photos/:id/preview
 GET                /api/photos/:id/file
 DELETE             /api/photos/:id
 ```
@@ -475,12 +474,16 @@ GET|PATCH|DELETE   /api/share-links/:id
 GET                /api/public/shares/:slug
 POST               /api/public/shares/:slug/unlock
 GET                /api/public/shares/:slug/photos/:photoId/file
+GET                /api/public/shares/:slug/photos/:photoId/thumbnail
 ```
 
 ### 管理员
 
 ```text
 GET          /api/admin/overview
+GET          /api/admin/uploads
+GET          /api/admin/uploads/records
+GET|PATCH    /api/admin/image-processing
 GET          /api/admin/classes
 GET          /api/admin/users
 PATCH        /api/admin/users/:id
@@ -621,6 +624,7 @@ npx wrangler d1 migrations apply picture-distributor-db --remote
 | `0003_own_read_backgrounds.sql` | 增加类介绍，以及初始自定义背景/恢复表 |
 | `0004_background_share_audit.sql` | 增加背景模式、分享密码加密显示材料和审计表 |
 | `0005_photo_metadata_audit_targets_email.sql` | 增加邮箱、图片元数据和审计对象字段 |
+| `0006_image_variants_upload_records.sql` | 增加 Images 开关和上传/衍生图用量记录；旧图片只补写 `decline`，不移动对象 |
 
 重要升级检查：全新 schema 支持 `own_read`。如果旧数据库最初通过 migration
 `0001` 创建，`roles.access_mode` 可能仍只有三个允许值，因为 migration `0003`
@@ -650,12 +654,13 @@ npm run check
 当前 `node:test` 覆盖：
 
 - 96-bit 带类型 ID；
+- 固定的 32 位小写 MD5 图片内容 ID；
 - 服务端和浏览器搜索语法；
 - 英文翻译与动态数量；
 - 图片元数据签名；
 - 带服务端密钥的分享密码验证和仅所有者可解密；
 - 全新 schema 与默认角色；
-- 旧图片到 `past` 的迁移；
+- 旧图片到 `past` 及上传记录的迁移；
 - Wrangler 静态资源、KV、任务恢复、死信队列和无 Vectorize 配置；
 - 可选数字参数默认值；
 - 图片字节签名、拒绝 SVG；

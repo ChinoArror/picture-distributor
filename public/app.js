@@ -146,6 +146,7 @@ const userNav = [
 const adminNav = [
   ["/admin", "home", "概览"],
   ["/admin/classes", "class", "全部类"],
+  ["/admin/uploads", "upload", "上传记录"],
   ["/admin/users", "users", "用户控制"],
   ["/admin/roles", "key", "权限控制"],
   ["/admin/audit", "history", "审计"],
@@ -1671,6 +1672,184 @@ async function renderAdminOverview() {
   }
 }
 
+async function renderAdminUploads() {
+  setPageTitle("图片上传记录");
+  const today = new Date();
+  const monthStart = new Date(today.getFullYear(), today.getMonth(), 1);
+  const filter = {
+    all: false,
+    from: localDateKey(monthStart),
+    to: localDateKey(today),
+  };
+  app.innerHTML = Workspace(`${PageHead("图片上传记录", "按用户查看上传、Images 处理次数和实际文件用量。")}
+    ${Card(`<div class="upload-filter-head"><div><h2>Images 处理</h2><p>开启后，新上传图片通过 Queue 生成预览图和缩略图；关闭后记录为 decline。</p></div>
+      <span class="visibility"><button class="switch" type="button" role="switch" aria-checked="false" data-images-toggle disabled></button><span data-images-label>载入中…</span></span></div>
+      <form class="upload-filter-form" data-upload-filter>
+        ${DateOnlyField("from", "开始日期", filter.from)}
+        ${DateOnlyField("to", "结束日期", filter.to)}
+        <div class="upload-filter-actions">${Button("应用", { tone: "primary", type: "submit" })}${Button("全部", { attrs: "data-upload-all" })}</div>
+      </form>`, "upload-filter-card")}
+    <div id="admin-uploads" class="loading-state">正在载入上传记录…</div>`, "/admin/uploads", { admin: true });
+  bindDateTimeFields();
+  const version = state.routeVersion;
+  const apiRange = () => {
+    if (filter.all) return { all: true };
+    const from = new Date(`${filter.from}T00:00:00`);
+    const to = new Date(`${filter.to}T00:00:00`);
+    to.setDate(to.getDate() + 1);
+    return { from: from.toISOString(), to: to.toISOString() };
+  };
+  const updateSetting = (setting) => {
+    const toggle = one("[data-images-toggle]");
+    const enabled = Boolean(setting?.enabled);
+    toggle.disabled = false;
+    toggle.classList.toggle("on", enabled);
+    toggle.setAttribute("aria-checked", String(enabled));
+    one("[data-images-label]").textContent = enabled ? "已开启" : "已关闭";
+  };
+  const load = async () => {
+    const root = byId("admin-uploads");
+    root.className = "loading-state";
+    root.innerHTML = "正在载入上传记录…";
+    try {
+      const [data, setting] = await Promise.all([
+        Client.adminUploads(apiRange()),
+        Client.imageProcessing(),
+      ]);
+      if (version !== state.routeVersion) return;
+      updateSetting(setting);
+      renderAdminUploadData(root, data, apiRange);
+    } catch (error) {
+      if (version !== state.routeVersion) return;
+      root.outerHTML = ErrorState(error, "data-retry-admin-uploads");
+      one("[data-retry-admin-uploads]")?.addEventListener("click", renderAdminUploads);
+    }
+  };
+  one("[data-upload-filter]")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const from = String(form.get("from") || "");
+    const to = String(form.get("to") || "");
+    if (!from || !to || to < from) {
+      toast("结束日期不能早于开始日期。", true);
+      return;
+    }
+    filter.all = false;
+    filter.from = from;
+    filter.to = to;
+    load();
+  });
+  one("[data-upload-all]")?.addEventListener("click", () => {
+    filter.all = true;
+    load();
+  });
+  one("[data-images-toggle]")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const enabled = button.getAttribute("aria-checked") !== "true";
+    button.disabled = true;
+    try {
+      const setting = await Client.updateImageProcessing(enabled);
+      updateSetting(setting);
+      toast(enabled ? "Images 处理已开启。" : "Images 处理已关闭。");
+      await load();
+    } catch (error) {
+      button.disabled = false;
+      toast(friendlyError(error), true);
+    }
+  });
+  await load();
+}
+
+function renderAdminUploadData(root, data, apiRange) {
+  const summary = data.summary || {};
+  const groups = listOf(data, "groups");
+  const stats = [
+    ["总上传数", Number(summary.totalUploads || 0)],
+    ["处理数", Number(summary.processedCount || 0)],
+    ["原图大小", formatBytes(summary.originalBytes || 0)],
+    ["整体占用", formatBytes(summary.totalBytes || 0)],
+  ];
+  root.className = "admin-upload-content";
+  root.innerHTML = `<div class="upload-range-label"><span class="badge purple">${data.range?.all ? "全部时间" : "所选日期范围"}</span>
+    <span>排队 ${Number(summary.pendingCount || 0)} · decline ${Number(summary.declineCount || 0)} · error ${Number(summary.errorCount || 0)}</span></div>
+    <div class="stats upload-stats">${stats.map(([label, value]) => Card(`<div class="stat-label">${escapeHtml(label)}</div><div class="stat-value">${escapeHtml(value)}</div>`, "stat")).join("")}</div>
+    <div class="upload-user-list">${groups.length ? groups.map((group) => `<article class="card upload-user-card">
+      <header class="upload-user-head">
+        <div class="upload-user-identity"><h3>${escapeHtml(group.uploaderName || "未知用户")}</h3>
+          ${group.authUuid ? `<div class="audit-uuid-line"><code class="audit-uuid" title="${escapeAttr(group.authUuid)}">${escapeHtml(group.authUuid)}</code><button class="icon-button" type="button" data-upload-copy="${escapeAttr(group.authUuid)}" aria-label="复制 UUID">${icon("copy")}</button></div>` : ""}
+        </div>
+        <div class="upload-user-summary">
+          <span><strong>${Number(group.totalUploads || 0)}</strong><small>总上传</small></span>
+          <span><strong>${Number(group.processedCount || 0)}</strong><small>已处理</small></span>
+          <span><strong>${formatBytes(group.totalBytes || 0)}</strong><small>经手文件</small></span>
+          ${Button("查看", { size: "small", attrs: `data-upload-view="${escapeAttr(group.key)}"` })}
+        </div>
+      </header>
+      <div class="upload-record-panel" data-upload-panel="${escapeAttr(group.key)}" hidden></div>
+    </article>`).join("") : EmptyState("upload", "暂无上传记录")}</div>`;
+  root.onclick = async (event) => {
+    const copy = event.target.closest("[data-upload-copy]");
+    if (copy) {
+      await copyText(copy.dataset.uploadCopy, false);
+      copy.classList.add("copied");
+      copy.innerHTML = icon("check");
+      return;
+    }
+    const button = event.target.closest("[data-upload-view]");
+    if (!button) return;
+    const panel = one(`[data-upload-panel="${cssEscape(button.dataset.uploadView)}"]`, root);
+    if (!panel) return;
+    if (!panel.hidden) {
+      panel.hidden = true;
+      button.querySelector("span").textContent = "查看";
+      return;
+    }
+    panel.hidden = false;
+    button.querySelector("span").textContent = "收起";
+    if (panel.dataset.loaded === "true") return;
+    panel.className = "upload-record-panel loading-state";
+    panel.textContent = "正在载入详细记录…";
+    button.disabled = true;
+    try {
+      const details = await Client.adminUploadRecords(button.dataset.uploadView, apiRange());
+      panel.className = "upload-record-panel";
+      panel.dataset.loaded = "true";
+      panel.innerHTML = details.records?.length
+        ? `<div class="upload-record-head"><span>原文件 / 上传后文件</span><span>时间 / 上传者</span><span>大小</span><span>Queue 状态</span></div>
+          <div class="upload-record-list">${details.records.map(uploadRecordMarkup).join("")}</div>
+          ${details.truncated ? `<p class="camera-note">记录过多，仅显示最近 5000 条。</p>` : ""}`
+        : EmptyState("upload", "暂无详细记录");
+    } catch (error) {
+      panel.className = "upload-record-panel";
+      panel.innerHTML = `<p class="error-text">${escapeHtml(friendlyError(error))}</p>`;
+    } finally {
+      button.disabled = false;
+    }
+  };
+}
+
+function uploadRecordMarkup(record) {
+  const status = String(record.queueStatus || "error");
+  const statusLabel = ({
+    queued: "queued",
+    processing: "processing",
+    completed: "completed",
+    decline: "decline",
+    error: "error",
+  })[status] || status;
+  const badge = status === "completed" ? "green" : status === "error" ? "red" : status === "processing" ? "purple" : "";
+  return `<div class="upload-record-row">
+    <div class="upload-record-files">
+      <span class="upload-file-name" title="${escapeAttr(record.originalFilename)}">${escapeHtml(record.originalFilename)}</span>
+      <span class="upload-stored-line"><code title="${escapeAttr(record.storedOriginalName)}">${escapeHtml(record.storedOriginalName)}</code><button class="icon-button" type="button" data-upload-copy="${escapeAttr(record.storedOriginalName)}" aria-label="复制上传后文件名">${icon("copy")}</button></span>
+      ${record.className ? `<small>${escapeHtml(record.className)}</small>` : ""}
+    </div>
+    <div class="upload-record-actor"><span>${formatDate(record.uploadedAt)}</span><small>${escapeHtml(record.uploaderName || "未知用户")}</small></div>
+    <div class="upload-record-size"><span>${formatBytes(record.originalBytes || 0)} 原图</span><small>${formatBytes(record.totalBytes || 0)} 整体 · ${formatBytes(record.previewBytes || 0)} preview · ${formatBytes(record.thumbnailBytes || 0)} thumbnail</small></div>
+    <div class="upload-record-status"><span class="badge ${badge}">${statusLabel}</span>${record.error ? `<small title="${escapeAttr(record.error)}">${escapeHtml(record.error)}</small>` : ""}</div>
+  </div>`;
+}
+
 async function renderAdminAudit() {
   setPageTitle("审计");
   app.innerHTML = Workspace(`${PageHead("审计", "按用户查看操作记录。")}
@@ -1750,6 +1929,7 @@ function auditActionName(action) {
     "admin.role.update": "修改角色",
     "admin.role.delete": "删除角色",
     "admin.force_delete": "强制删除",
+    "admin.image_processing.update": "修改 Images 处理",
   };
   const en = {
     "class.create": "Created class",
@@ -1772,6 +1952,7 @@ function auditActionName(action) {
     "admin.role.update": "Updated role",
     "admin.role.delete": "Deleted role",
     "admin.force_delete": "Force deleted",
+    "admin.image_processing.update": "Changed Images processing",
   };
   return (getLocale() === "en" ? en : zh)[action] || action;
 }
@@ -2185,6 +2366,7 @@ async function renderRoute() {
   if (path.startsWith("/s/")) return renderPublicShare(decodeURIComponent(path.slice(3)));
   if (path === "/admin") return renderAdminOverview();
   if (path === "/admin/classes") return renderAdminClasses();
+  if (path === "/admin/uploads") return renderAdminUploads();
   if (path === "/admin/users") return renderAdminUsers();
   if (path === "/admin/roles") return renderAdminRoles();
   if (path === "/admin/audit") return renderAdminAudit();
@@ -2342,20 +2524,31 @@ function DateTimeField(name, label, value) {
   </div>`;
 }
 
+function DateOnlyField(name, label, value) {
+  const date = parseLocalDateTime(`${value}T00:00`);
+  return `<div class="field date-time-field" data-datetime-field data-date-only>
+    <span>${escapeHtml(label)}</span>
+    <input type="hidden" name="${escapeAttr(name)}" value="${escapeAttr(localDateKey(date))}" required>
+    <button class="date-trigger" type="button" data-date-trigger>${escapeHtml(formatDay(date))}</button>
+    <div class="date-popover ui-modal-scroll" data-date-popover hidden></div>
+  </div>`;
+}
+
 function bindDateTimeFields() {
   all("[data-datetime-field]").forEach((field) => {
     const hidden = one('input[type="hidden"]', field);
     const trigger = one("[data-date-trigger]", field);
     const popover = one("[data-date-popover]", field);
-    let selected = parseLocalDateTime(hidden.value);
+    const dateOnly = field.hasAttribute("data-date-only");
+    let selected = parseLocalDateTime(dateOnly ? `${hidden.value}T00:00` : hidden.value);
     let view = new Date(selected);
 
     const commit = () => {
-      hidden.value = toLocalDateTime(selected);
-      trigger.textContent = formatDate(selected);
+      hidden.value = dateOnly ? localDateKey(selected) : toLocalDateTime(selected);
+      trigger.textContent = dateOnly ? formatDay(selected) : formatDate(selected);
     };
     const paint = () => {
-      popover.innerHTML = calendarMarkup(view, selected);
+      popover.innerHTML = calendarMarkup(view, selected, dateOnly);
       one("[data-calendar-month]", popover).addEventListener("change", (event) => {
         view.setMonth(Number(event.currentTarget.value));
         paint();
@@ -2374,23 +2567,24 @@ function bindDateTimeFields() {
       });
       all("[data-calendar-day]", popover).forEach((button) => button.addEventListener("click", () => {
         const next = parseLocalDateTime(button.dataset.calendarDay);
-        next.setHours(selected.getHours(), selected.getMinutes(), 0, 0);
+        if (!dateOnly) next.setHours(selected.getHours(), selected.getMinutes(), 0, 0);
         selected = next;
         view = new Date(next);
         commit();
         paint();
       }));
-      one("[data-calendar-hour]", popover).addEventListener("change", (event) => {
+      one("[data-calendar-hour]", popover)?.addEventListener("change", (event) => {
         selected.setHours(Number(event.currentTarget.value));
         commit();
       });
-      one("[data-calendar-minute]", popover).addEventListener("change", (event) => {
+      one("[data-calendar-minute]", popover)?.addEventListener("change", (event) => {
         selected.setMinutes(Number(event.currentTarget.value));
         commit();
       });
       one("[data-calendar-today]", popover).addEventListener("click", () => {
         const now = new Date();
-        now.setSeconds(0, 0);
+        if (dateOnly) now.setHours(0, 0, 0, 0);
+        else now.setSeconds(0, 0);
         selected = now;
         view = new Date(now);
         commit();
@@ -2413,7 +2607,7 @@ function bindDateTimeFields() {
   state.pageCleanup.push(() => document.removeEventListener("pointerdown", closeCalendars));
 }
 
-function calendarMarkup(view, selected) {
+function calendarMarkup(view, selected, dateOnly = false) {
   const year = view.getFullYear();
   const month = view.getMonth();
   const first = new Date(year, month, 1);
@@ -2425,8 +2619,13 @@ function calendarMarkup(view, selected) {
     const key = localDateKey(date);
     return `<button type="button" class="calendar-day ${date.getMonth() !== month ? "outside" : ""} ${key === selectedKey ? "selected" : ""}" data-calendar-day="${key}T00:00">${date.getDate()}</button>`;
   }).join("");
-  const monthOptions = Array.from({ length: 12 }, (_, index) =>
-    `<option value="${index}" ${index === month ? "selected" : ""}>${index + 1} 月</option>`).join("");
+  const englishCalendar = getLocale() === "en";
+  const monthOptions = Array.from({ length: 12 }, (_, index) => {
+    const label = englishCalendar
+      ? new Intl.DateTimeFormat("en-US", { month: "short" }).format(new Date(2020, index, 1))
+      : `${index + 1} 月`;
+    return `<option value="${index}" ${index === month ? "selected" : ""}>${label}</option>`;
+  }).join("");
   const yearOptions = Array.from({ length: 11 }, (_, index) => year - 5 + index)
     .map((value) => `<option value="${value}" ${value === year ? "selected" : ""}>${value}</option>`).join("");
   const hourOptions = Array.from({ length: 24 }, (_, value) =>
@@ -2437,10 +2636,10 @@ function calendarMarkup(view, selected) {
     <select class="select compact" data-calendar-month>${monthOptions}</select>
     <select class="select compact" data-calendar-year>${yearOptions}</select>
     <button type="button" class="icon-button" data-calendar-next aria-label="下个月">${icon("right")}</button></div>
-    <div class="calendar-week">${["日","一","二","三","四","五","六"].map((day) => `<span>${day}</span>`).join("")}</div>
+    <div class="calendar-week">${(englishCalendar ? ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"] : ["日","一","二","三","四","五","六"]).map((day) => `<span>${day}</span>`).join("")}</div>
     <div class="calendar-days">${days}</div>
     <div class="calendar-foot"><button type="button" class="button small" data-calendar-today>今天</button>
-      <label>时间 <select class="select compact" data-calendar-hour>${hourOptions}</select> : <select class="select compact" data-calendar-minute>${minuteOptions}</select></label></div>`;
+      ${dateOnly ? "" : `<label>时间 <select class="select compact" data-calendar-hour>${hourOptions}</select> : <select class="select compact" data-calendar-minute>${minuteOptions}</select></label>`}</div>`;
 }
 
 function parseLocalDateTime(value) {
@@ -2450,6 +2649,14 @@ function parseLocalDateTime(value) {
 
 function localDateKey(date) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function formatDay(date) {
+  return new Intl.DateTimeFormat(dateLocale(), {
+    year: "numeric",
+    month: "short",
+    day: "numeric",
+  }).format(date);
 }
 
 function bytesToGb(value) {

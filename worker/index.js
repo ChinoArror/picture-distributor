@@ -1,4 +1,5 @@
 import { newId, parseClassQuery, classNameRelevance } from "./lib/core.js";
+import { contentHashId } from "./lib/ids.js";
 import {
   randomToken,
   sha256,
@@ -20,6 +21,7 @@ const PUBLIC_CACHE_KEY = "public-classes:v2";
 const NORMAL_SESSION_SECONDS = 14 * 24 * 60 * 60;
 const TEST_SESSION_SECONDS = 30 * 60;
 const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_IMAGE_TRANSFORM_BYTES = 20 * 1024 * 1024;
 const MAX_QUEUE_ATTEMPTS = 4;
 const STATIC_CSP = [
   "default-src 'self'",
@@ -82,9 +84,14 @@ export async function enqueuePendingJobs(env) {
       "updated_at=CURRENT_TIMESTAMP WHERE status='processing' " +
       "AND datetime(updated_at)<datetime('now','-15 minutes')"
     ),
+    env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='queued'," +
+      "error_message='Recovered stale image processing claim',updated_at=CURRENT_TIMESTAMP " +
+      "WHERE queue_status='processing' AND datetime(updated_at)<datetime('now','-15 minutes')"
+    ),
   ]);
   const includeFailed = String(env.RETRY_FAILED_JOBS || "").toLowerCase() === "true";
-  const [jobRows, photoRows, searchRows] = await env.DB.batch([
+  const [jobRows, photoRows, searchRows, variantRows] = await env.DB.batch([
     env.DB.prepare(
       `SELECT id,kind FROM deletion_jobs WHERE status ${includeFailed ? "IN ('pending','failed')" : "='pending'"} ` +
       "ORDER BY created_at LIMIT 50"
@@ -95,16 +102,23 @@ export async function enqueuePendingJobs(env) {
     env.DB.prepare(
       "SELECT id FROM search_tasks WHERE status='pending' ORDER BY created_at LIMIT 50"
     ),
+    env.DB.prepare(
+      "SELECT photo_id FROM photo_upload_records WHERE photo_id IS NOT NULL AND queue_status='queued' " +
+      "ORDER BY uploaded_at LIMIT 50"
+    ),
   ]);
   const jobs = jobRows.results || [];
   const photos = photoRows.results || [];
   const searches = searchRows.results || [];
-  if (jobs.length || photos.length) {
-    await env.INGEST_QUEUE.sendBatch([
+  const variants = variantRows.results || [];
+  if (jobs.length || photos.length || variants.length) {
+    await sendQueueMessages(env.INGEST_QUEUE, [
       ...jobs.map((job) => ({
-        body: { type: job.kind === "rekey_photo" ? "storage.rekey" : "storage.delete", jobId: job.id },
+        type: job.kind === "rekey_photo" ? "storage.rekey" : "storage.delete",
+        jobId: job.id,
       })),
-      ...photos.map((photo) => ({ body: { type: "photo.ingest", photoId: photo.id } })),
+      ...photos.map((photo) => ({ type: "photo.ingest", photoId: photo.id })),
+      ...variants.map((photo) => ({ type: "photo.variants", photoId: photo.photo_id })),
     ]);
   }
   if (searches.length) {
@@ -112,7 +126,7 @@ export async function enqueuePendingJobs(env) {
       searches.map((task) => ({ body: { type: "search.run", taskId: task.id } }))
     );
   }
-  return jobs.length + photos.length + searches.length;
+  return jobs.length + photos.length + searches.length + variants.length;
 }
 
 export async function cleanupExpiredTempData(env) {
@@ -231,6 +245,8 @@ async function routeRequest(request, env, ctx) {
   if (match && method === "GET") return handlePhotoFile(request, env, decodePart(match[1]));
   match = path.match(/^\/api\/photos\/([^/]+)\/thumbnail$/);
   if (match && method === "GET") return handlePhotoThumbnail(request, env, decodePart(match[1]));
+  match = path.match(/^\/api\/photos\/([^/]+)\/preview$/);
+  if (match && method === "GET") return handlePhotoPreview(request, env, decodePart(match[1]));
   match = path.match(/^\/api\/photos\/([^/]+)$/);
   if (match && method === "DELETE") return handleDeletePhoto(request, env, decodePart(match[1]));
 
@@ -256,14 +272,22 @@ async function routeRequest(request, env, ctx) {
 
   match = path.match(/^\/api\/public\/shares\/([^/]+)\/unlock$/);
   if (match && method === "POST") return handleUnlockShare(request, env, decodePart(match[1]));
+  match = path.match(/^\/api\/public\/shares\/([^/]+)\/photos\/([^/]+)\/thumbnail$/);
+  if (match && method === "GET") {
+    return handlePublicSharePhoto(request, env, decodePart(match[1]), decodePart(match[2]), "thumbnail");
+  }
   match = path.match(/^\/api\/public\/shares\/([^/]+)\/photos\/([^/]+)\/file$/);
   if (match && method === "GET") {
-    return handlePublicSharePhoto(request, env, decodePart(match[1]), decodePart(match[2]));
+    return handlePublicSharePhoto(request, env, decodePart(match[1]), decodePart(match[2]), "original");
   }
   match = path.match(/^\/api\/public\/shares\/([^/]+)$/);
   if (match && method === "GET") return handlePublicShare(request, env, decodePart(match[1]));
 
   if (method === "GET" && path === "/api/admin/overview") return handleAdminOverview(request, env);
+  if (method === "GET" && path === "/api/admin/uploads") return handleAdminUploads(request, env);
+  if (method === "GET" && path === "/api/admin/uploads/records") return handleAdminUploadRecords(request, env);
+  if (method === "GET" && path === "/api/admin/image-processing") return handleImageProcessingSetting(request, env);
+  if (method === "PATCH" && path === "/api/admin/image-processing") return handleUpdateImageProcessingSetting(request, env);
   if (method === "GET" && path === "/api/admin/audit") return handleAdminAudit(request, env);
   if (method === "GET" && path === "/api/admin/classes") return handleAdminClasses(request, env);
   if (method === "GET" && path === "/api/admin/users") return handleAdminUsers(request, env);
@@ -688,33 +712,62 @@ async function handleUploadPhotos(request, env, classId) {
   const validatedTypes = [];
   for (const file of files) validatedTypes.push(await validateImageFile(file, MAX_UPLOAD_BYTES));
   const metadata = await Promise.all(files.map(extractPhotoMetadata));
+  const processingEnabled = await imageProcessingEnabled(env);
+  const rows = [];
+  const requestKeys = new Set();
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const id = newId("p_");
+    const uploadId = newId("up_");
+    const contentType = validatedTypes[index];
+    const extension = trustedExtension(contentType);
+    const contentId = await contentHashId(file);
+    const storedOriginalName = `p_or_${contentId}.${extension}`;
+    const storedPreviewName = `p_pr_${contentId}.webp`;
+    const storedThumbnailName = `p_th_${contentId}.webp`;
+    const key = `originals/${classId}/${storedOriginalName}`;
+    if (requestKeys.has(key)) throw new HttpError("The same image was included more than once", 409);
+    requestKeys.add(key);
+    rows.push({
+      id,
+      uploadId,
+      classId,
+      ownerId: photoClass.owner_user_id,
+      key,
+      previewKey: `previews/${classId}/${storedPreviewName}`,
+      thumbnailKey: `thumbnails/${classId}/${storedThumbnailName}`,
+      storedOriginalName,
+      name: String(file.name || storedOriginalName).slice(0, 255),
+      contentId,
+      type: contentType,
+      bytes: file.size,
+      metadata: metadata[index],
+      file,
+    });
+  }
+  const existing = await env.DB.batch(rows.map((row) =>
+    env.DB.prepare("SELECT id FROM photos WHERE r2_key=?1 LIMIT 1").bind(row.key)
+  ));
+  if (existing.some((result) => result.results?.length)) {
+    throw new HttpError("This image already exists in the selected class", 409);
+  }
   const totalBytes = files.reduce((sum, file) => sum + file.size, 0);
   const owner = await getUserById(photoClass.owner_user_id, env);
   if (!owner) throw new HttpError("Class owner no longer exists", 409);
   await reserveStorage(owner, totalBytes, env);
 
-  const rows = files.map((file, index) => {
-    const id = newId("p_");
-    const contentType = validatedTypes[index];
-    const extension = trustedExtension(contentType);
-    return {
-      id,
-      classId,
-      ownerId: owner.id,
-      key: `${classId}/${id}.${extension}`,
-      name: String(file.name || `${id}.${extension}`).slice(0, 255),
-      type: contentType,
-      bytes: file.size,
-      metadata: metadata[index],
-      file,
-    };
-  });
   const storedKeys = [];
   try {
     for (const row of rows) {
       await env.PHOTO_BUCKET.put(row.key, row.file.stream(), {
         httpMetadata: { contentType: row.type },
-        customMetadata: { originalName: row.name, classId, photoId: row.id },
+        customMetadata: {
+          originalName: row.name,
+          storedName: row.storedOriginalName,
+          contentId: row.contentId,
+          classId,
+          photoId: row.id,
+        },
       });
       storedKeys.push(row.key);
     }
@@ -724,20 +777,66 @@ async function handleUploadPhotos(request, env, classId) {
         "(id,class_id,owner_user_id,r2_key,original_name,content_type,size_bytes,byte_size,metadata_json,status,updated_at) " +
         "VALUES (?1,?2,?3,?4,?5,?6,?7,?7,?8,'uploaded',CURRENT_TIMESTAMP)"
       ).bind(row.id, row.classId, row.ownerId, row.key, row.name, row.type, row.bytes, JSON.stringify(row.metadata))),
+      ...rows.map((row) => env.DB.prepare(
+        "INSERT INTO photo_upload_records " +
+        "(id,photo_id,uploader_user_id,uploader_auth_uuid,uploader_name,class_id,class_name," +
+        "original_filename,stored_original_name,content_id,original_key,preview_key,thumbnail_key," +
+        "original_bytes,total_bytes,queue_status,updated_at) " +
+        "VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?14,?15,CURRENT_TIMESTAMP)"
+      ).bind(
+        row.uploadId,
+        row.id,
+        user.id,
+        user.auth_uuid || "",
+        user.username || user.name || "Unknown user",
+        row.classId,
+        photoClass.name,
+        row.name,
+        row.storedOriginalName,
+        row.contentId,
+        row.key,
+        row.previewKey,
+        row.thumbnailKey,
+        row.bytes,
+        processingEnabled ? "queued" : "decline"
+      )),
     ]);
   } catch (error) {
     await Promise.allSettled(storedKeys.map((key) => env.PHOTO_BUCKET.delete(key)));
     await releaseStorage(owner.id, totalBytes, env);
     throw error;
   }
-  let queued = true;
+  let faceQueued = true;
+  let variantsQueued = !processingEnabled;
   try {
-    await env.INGEST_QUEUE.sendBatch(rows.map((row) => ({ body: { type: "photo.ingest", photoId: row.id } })));
+    await sendQueueMessages(
+      env.INGEST_QUEUE,
+      rows.map((row) => ({ type: "photo.ingest", photoId: row.id }))
+    );
   } catch (error) {
-    queued = false;
+    faceQueued = false;
     console.error("Ingest queue send failed; photos remain retryable", error);
   }
-  return jsonResponse({ uploaded: rows.length, photos: rows.map((row) => photoDto({
+  if (processingEnabled) {
+    try {
+      await sendQueueMessages(
+        env.INGEST_QUEUE,
+        rows.map((row) => ({ type: "photo.variants", photoId: row.id }))
+      );
+      variantsQueued = true;
+    } catch (error) {
+      await env.DB.batch(rows.map((row) => env.DB.prepare(
+        "UPDATE photo_upload_records SET queue_status='error',error_message=?2," +
+        "updated_at=CURRENT_TIMESTAMP WHERE photo_id=?1 AND queue_status='queued'"
+      ).bind(row.id, error instanceof Error ? error.message : String(error))));
+      console.error("Image processing queue send failed", error);
+    }
+  }
+  const queued = faceQueued && variantsQueued;
+  return jsonResponse({ uploaded: rows.length, queued, imageProcessing: {
+    enabled: processingEnabled,
+    status: processingEnabled ? (variantsQueued ? "queued" : "error") : "decline",
+  }, photos: rows.map((row) => photoDto({
     id: row.id,
     class_id: row.classId,
     owner_user_id: row.ownerId,
@@ -746,7 +845,7 @@ async function handleUploadPhotos(request, env, classId) {
     byte_size: row.bytes,
     metadata_json: JSON.stringify(row.metadata),
     status: "uploaded",
-  })), queued }, queued ? 202 : 201);
+  })) }, queued ? 202 : 201);
 }
 
 async function handleLegacyAdminUpload(request, env) {
@@ -960,24 +1059,39 @@ async function recordClassSearch(userId, query, photoIds, env) {
 }
 
 async function handlePhotoFile(request, env, photoId) {
-  const photo = await getPhoto(photoId, env);
-  if (!photo) throw new HttpError("Photo not found", 404);
-  const visibility = classVisibility(photo);
-  const publiclyVisible = !photo.class_removed_at && !photo.class_deleted_at && visibility === "public";
-  let allowed = publiclyVisible;
-  if (!allowed) {
-    const user = await getSessionUser(request, env);
-    allowed = Boolean(user && await canReadPhoto(user, photo, env));
-  }
-  if (!allowed) throw new HttpError("Photo not found", 404);
+  const { photo } = await authorizedPhoto(request, env, photoId);
   return streamR2Object(request, env, photo.r2_key, {
     contentType: photo.content_type,
     filename: photo.original_name,
-    publicCache: publiclyVisible,
+    publicCache: false,
   });
 }
 
 async function handlePhotoThumbnail(request, env, photoId) {
+  const { photo } = await authorizedPhoto(request, env, photoId);
+  if (photo.variant_status === "completed" && photo.thumbnail_key) {
+    return streamAuthorizedVariant(request, env, photo.thumbnail_key, "image/webp");
+  }
+  return streamR2Object(request, env, photo.r2_key, {
+    contentType: photo.content_type,
+    filename: photo.original_name,
+    publicCache: false,
+  });
+}
+
+async function handlePhotoPreview(request, env, photoId) {
+  const { photo } = await authorizedPhoto(request, env, photoId);
+  if (photo.variant_status === "completed" && photo.preview_key) {
+    return streamAuthorizedVariant(request, env, photo.preview_key, "image/webp");
+  }
+  return streamR2Object(request, env, photo.r2_key, {
+    contentType: photo.content_type,
+    filename: photo.original_name,
+    publicCache: false,
+  });
+}
+
+async function authorizedPhoto(request, env, photoId) {
   const photo = await getPhoto(photoId, env);
   if (!photo) throw new HttpError("Photo not found", 404);
   const visibility = classVisibility(photo);
@@ -988,39 +1102,7 @@ async function handlePhotoThumbnail(request, env, photoId) {
     allowed = Boolean(user && await canReadPhoto(user, photo, env));
   }
   if (!allowed) throw new HttpError("Photo not found", 404);
-  if (!env.IMAGES) {
-    return streamR2Object(request, env, photo.r2_key, {
-      contentType: photo.content_type,
-      filename: photo.original_name,
-      publicCache: publiclyVisible,
-    });
-  }
-  const object = await env.PHOTO_BUCKET.get(photo.r2_key);
-  if (!object) throw new HttpError("File not found", 404);
-  try {
-    const transformed = await env.IMAGES
-      .input(object.body)
-      .transform({ width: 520 })
-      .output({ format: "image/webp", quality: 74 })
-      .response();
-    const headers = new Headers(transformed.headers);
-    headers.set("content-type", "image/webp");
-    headers.set("cache-control", publiclyVisible
-      ? "public, max-age=3600, stale-while-revalidate=86400"
-      : "private, max-age=300");
-    headers.set("content-disposition", "inline");
-    headers.set("x-content-type-options", "nosniff");
-    return new Response(request.method === "HEAD" ? null : transformed.body, {
-      status: transformed.status,
-      headers,
-    });
-  } catch {
-    return streamR2Object(request, env, photo.r2_key, {
-      contentType: photo.content_type,
-      filename: photo.original_name,
-      publicCache: publiclyVisible,
-    });
-  }
+  return { photo, publiclyVisible };
 }
 
 async function handleDeletePhoto(request, env, photoId) {
@@ -1543,7 +1625,7 @@ async function handlePublicShare(request, env, slug) {
     photos: photos.map((photo) => ({
       ...photoDto(photo),
       url: publicSharePhotoUrl(link.slug, photo.id),
-      thumbnailUrl: publicSharePhotoUrl(link.slug, photo.id),
+      thumbnailUrl: publicSharePhotoThumbnailUrl(link.slug, photo.id),
     })),
   });
 }
@@ -1612,14 +1694,16 @@ async function clearRateLimit(env, key) {
   await env.DB.prepare("DELETE FROM rate_limit_buckets WHERE bucket_key=?1").bind(key).run();
 }
 
-async function handlePublicSharePhoto(request, env, slug, photoId) {
+async function handlePublicSharePhoto(request, env, slug, photoId, variant = "original") {
   const link = await getActiveShare(slug, env);
   if (link.password_hash && !(await hasShareSession(request, link.id, env))) {
     throw new HttpError("Share password required", 401);
   }
   const photo = await env.DB.prepare(
-    "SELECT p.*,c.name class_name,c.visibility,c.is_open,c.deleted_at class_deleted_at " +
+    "SELECT p.*,c.name class_name,c.visibility,c.is_open,c.deleted_at class_deleted_at," +
+    "r.thumbnail_key,r.queue_status variant_status " +
     "FROM photos p JOIN photo_classes c ON c.id=p.class_id JOIN share_links l ON l.id=?2 " +
+    "LEFT JOIN photo_upload_records r ON r.photo_id=p.id " +
     "WHERE p.id=?1 AND p.deleted_at IS NULL AND (" +
     "(EXISTS(SELECT 1 FROM share_link_photos x WHERE x.share_link_id=?2 AND x.photo_id=p.id) " +
     "AND (p.owner_user_id=l.owner_user_id " +
@@ -1631,6 +1715,9 @@ async function handlePublicSharePhoto(request, env, slug, photoId) {
     "WHERE x.share_link_id=?2 AND x.class_id=p.class_id))) LIMIT 1"
   ).bind(photoId, link.id).first();
   if (!photo) throw new HttpError("Photo not found", 404);
+  if (variant === "thumbnail" && photo.variant_status === "completed" && photo.thumbnail_key) {
+    return streamAuthorizedVariant(request, env, photo.thumbnail_key, "image/webp");
+  }
   return streamR2Object(request, env, photo.r2_key, {
     contentType: photo.content_type,
     filename: photo.original_name,
@@ -1751,6 +1838,196 @@ async function handleAdminOverview(request, env) {
     activeShareCount: Number(shares.results?.[0]?.count || 0),
     pendingJobCount: Number(jobs.results?.[0]?.count || 0),
   });
+}
+
+async function handleAdminUploads(request, env) {
+  await requireAdmin(request, env);
+  const range = parseUploadRange(new URL(request.url), "r");
+  const summaryQuery =
+    "SELECT COUNT(*) total_uploads," +
+    "SUM(CASE WHEN r.queue_status='completed' THEN 1 ELSE 0 END) processed_count," +
+    "SUM(CASE WHEN r.queue_status IN ('queued','processing') THEN 1 ELSE 0 END) pending_count," +
+    "SUM(CASE WHEN r.queue_status='error' THEN 1 ELSE 0 END) error_count," +
+    "SUM(CASE WHEN r.queue_status='decline' THEN 1 ELSE 0 END) decline_count," +
+    "COALESCE(SUM(r.original_bytes),0) original_bytes,COALESCE(SUM(r.total_bytes),0) total_bytes " +
+    `FROM photo_upload_records r ${range.where}`;
+  const groupQuery =
+    "SELECT r.uploader_user_id,r.uploader_auth_uuid,r.uploader_name," +
+    "COUNT(*) total_uploads," +
+    "SUM(CASE WHEN r.queue_status='completed' THEN 1 ELSE 0 END) processed_count," +
+    "SUM(CASE WHEN r.queue_status IN ('queued','processing') THEN 1 ELSE 0 END) pending_count," +
+    "SUM(CASE WHEN r.queue_status='error' THEN 1 ELSE 0 END) error_count," +
+    "SUM(CASE WHEN r.queue_status='decline' THEN 1 ELSE 0 END) decline_count," +
+    "COALESCE(SUM(r.original_bytes),0) original_bytes,COALESCE(SUM(r.total_bytes),0) total_bytes," +
+    "MAX(r.uploaded_at) latest_upload " +
+    `FROM photo_upload_records r ${range.where} ` +
+    "GROUP BY r.uploader_user_id,r.uploader_auth_uuid,r.uploader_name " +
+    "ORDER BY datetime(latest_upload) DESC";
+  const statements = [env.DB.prepare(summaryQuery), env.DB.prepare(groupQuery)]
+    .map((statement) => range.binds.length ? statement.bind(...range.binds) : statement);
+  const [summaryRows, groupRows] = await env.DB.batch(statements);
+  const summary = summaryRows.results?.[0] || {};
+  return jsonResponse({
+    range: { all: range.all, from: range.from, to: range.to },
+    summary: uploadSummaryDto(summary),
+    groups: (groupRows.results || []).map((row) => ({
+      key: uploadGroupKey(row),
+      userId: row.uploader_user_id || "",
+      authUuid: row.uploader_auth_uuid || "",
+      uploaderName: row.uploader_name || "Unknown user",
+      latestUpload: row.latest_upload,
+      ...uploadSummaryDto(row),
+    })),
+  });
+}
+
+async function handleAdminUploadRecords(request, env) {
+  await requireAdmin(request, env);
+  const url = new URL(request.url);
+  const key = String(url.searchParams.get("key") || "");
+  if (!key) throw new HttpError("Upload group key is required", 400);
+  const range = parseUploadRange(url, "r");
+  const binds = [...range.binds];
+  let identityClause;
+  if (key.startsWith("user:")) {
+    binds.push(key.slice(5));
+    identityClause = `r.uploader_user_id=?${binds.length}`;
+  } else if (key.startsWith("uuid:")) {
+    binds.push(key.slice(5));
+    identityClause = `r.uploader_user_id IS NULL AND r.uploader_auth_uuid=?${binds.length}`;
+  } else if (key.startsWith("name:")) {
+    binds.push(key.slice(5));
+    identityClause = `r.uploader_user_id IS NULL AND r.uploader_auth_uuid='' AND r.uploader_name=?${binds.length}`;
+  } else {
+    throw new HttpError("Invalid upload group key", 400);
+  }
+  const connector = range.where ? " AND " : " WHERE ";
+  const statement = env.DB.prepare(
+    "SELECT r.* FROM photo_upload_records r" + range.where + connector + identityClause +
+    " ORDER BY datetime(r.uploaded_at) DESC,r.id DESC LIMIT 5000"
+  ).bind(...binds);
+  const rows = await statement.all();
+  return jsonResponse({
+    key,
+    records: (rows.results || []).map(uploadRecordDto),
+    truncated: Number(rows.results?.length || 0) >= 5000,
+  });
+}
+
+async function handleImageProcessingSetting(request, env) {
+  await requireAdmin(request, env);
+  const row = await env.DB.prepare(
+    "SELECT s.enabled,s.updated_at,COALESCE(NULLIF(u.username,''),u.name) updated_by " +
+    "FROM image_processing_settings s LEFT JOIN app_users u ON u.id=s.updated_by_user_id " +
+    "WHERE s.id=1 LIMIT 1"
+  ).first();
+  return jsonResponse({
+    enabled: row ? Boolean(row.enabled) : true,
+    updatedAt: row?.updated_at || null,
+    updatedBy: row?.updated_by || "",
+  });
+}
+
+async function handleUpdateImageProcessingSetting(request, env) {
+  const admin = await requireAdmin(request, env);
+  const body = await safeJson(request);
+  if (typeof body.enabled !== "boolean") throw new HttpError("enabled must be a boolean", 400);
+  const statements = [env.DB.prepare(
+    "INSERT INTO image_processing_settings (id,enabled,updated_by_user_id,updated_at) " +
+    "VALUES (1,?1,?2,CURRENT_TIMESTAMP) ON CONFLICT(id) DO UPDATE SET " +
+    "enabled=excluded.enabled,updated_by_user_id=excluded.updated_by_user_id,updated_at=CURRENT_TIMESTAMP"
+  ).bind(body.enabled ? 1 : 0, admin.id)];
+  if (!body.enabled) {
+    statements.push(env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='decline',error_message=''," +
+      "processed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE queue_status='queued'"
+    ));
+  }
+  await env.DB.batch(statements);
+  return jsonResponse({
+    enabled: body.enabled,
+    target: {
+      kind: "setting",
+      id: "image-processing",
+      name: body.enabled ? "Images processing enabled" : "Images processing disabled",
+      count: 1,
+    },
+  });
+}
+
+function parseUploadRange(url, alias) {
+  if (url.searchParams.get("all") === "1") {
+    return { all: true, from: null, to: null, where: "", binds: [] };
+  }
+  const from = parseUploadBoundary(url.searchParams.get("from"), "from");
+  const to = parseUploadBoundary(url.searchParams.get("to"), "to");
+  if (from && to && to <= from) throw new HttpError("Upload range end must be after start", 400);
+  const binds = [];
+  const clauses = [];
+  if (from) {
+    binds.push(from);
+    clauses.push(`datetime(${alias}.uploaded_at)>=datetime(?${binds.length})`);
+  }
+  if (to) {
+    binds.push(to);
+    clauses.push(`datetime(${alias}.uploaded_at)<datetime(?${binds.length})`);
+  }
+  return {
+    all: false,
+    from: from || null,
+    to: to || null,
+    where: clauses.length ? ` WHERE ${clauses.join(" AND ")}` : "",
+    binds,
+  };
+}
+
+function parseUploadBoundary(value, name) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (!Number.isFinite(date.valueOf())) throw new HttpError(`${name} must be a valid date`, 400);
+  return date.toISOString();
+}
+
+function uploadGroupKey(row) {
+  if (row.uploader_user_id) return `user:${row.uploader_user_id}`;
+  if (row.uploader_auth_uuid) return `uuid:${row.uploader_auth_uuid}`;
+  return `name:${row.uploader_name || "Unknown user"}`;
+}
+
+function uploadSummaryDto(row) {
+  return {
+    totalUploads: Number(row.total_uploads || 0),
+    processedCount: Number(row.processed_count || 0),
+    pendingCount: Number(row.pending_count || 0),
+    errorCount: Number(row.error_count || 0),
+    declineCount: Number(row.decline_count || 0),
+    originalBytes: Number(row.original_bytes || 0),
+    totalBytes: Number(row.total_bytes || 0),
+  };
+}
+
+function uploadRecordDto(row) {
+  return {
+    id: row.id,
+    photoId: row.photo_id || "",
+    uploaderUserId: row.uploader_user_id || "",
+    uploaderAuthUuid: row.uploader_auth_uuid || "",
+    uploaderName: row.uploader_name || "Unknown user",
+    classId: row.class_id || "",
+    className: row.class_name || "",
+    originalFilename: row.original_filename,
+    storedOriginalName: row.stored_original_name,
+    contentId: row.content_id || "",
+    originalBytes: Number(row.original_bytes || 0),
+    previewBytes: Number(row.preview_bytes || 0),
+    thumbnailBytes: Number(row.thumbnail_bytes || 0),
+    totalBytes: Number(row.total_bytes || 0),
+    queueStatus: row.queue_status,
+    error: row.error_message || "",
+    uploadedAt: row.uploaded_at,
+    processingStartedAt: row.processing_started_at || null,
+    processedAt: row.processed_at || null,
+  };
 }
 
 async function handleAdminAudit(request, env) {
@@ -2015,7 +2292,8 @@ async function handleStartRekey(request, env) {
   const admin = await requireAdmin(request, env);
   const limit = clampInteger(new URL(request.url).searchParams.get("limit"), 1, 500, 100);
   const rows = await env.DB.prepare(
-    "SELECT id,owner_user_id FROM photos WHERE deleted_at IS NULL AND r2_key NOT LIKE class_id||'/%' " +
+    "SELECT id,owner_user_id FROM photos WHERE deleted_at IS NULL " +
+    "AND r2_key NOT LIKE class_id||'/%' AND r2_key NOT LIKE 'originals/'||class_id||'/%' " +
     "ORDER BY created_at LIMIT ?1"
   ).bind(limit).all();
   const jobs = (rows.results || []).map((photo) => ({
@@ -2030,7 +2308,10 @@ async function handleStartRekey(request, env) {
   ).bind(job.id, job.targetId, admin.id, job.ownerId))) : [];
   const queued = jobs.filter((_, index) => Number(results[index]?.meta?.changes || 0) > 0);
   if (queued.length) {
-    await env.INGEST_QUEUE.sendBatch(queued.map((job) => ({ body: { type: "storage.rekey", jobId: job.id } })));
+    await sendQueueMessages(
+      env.INGEST_QUEUE,
+      queued.map((job) => ({ type: "storage.rekey", jobId: job.id }))
+    );
   }
   return jsonResponse({ discovered: jobs.length, queued: queued.length, jobIds: queued.map((job) => job.id) }, 202);
 }
@@ -2041,7 +2322,8 @@ async function handleRekeyStatus(request, env) {
     "SELECT status,COUNT(*) count FROM deletion_jobs WHERE kind='rekey_photo' GROUP BY status"
   ).all();
   const remaining = await env.DB.prepare(
-    "SELECT COUNT(*) count FROM photos WHERE deleted_at IS NULL AND r2_key NOT LIKE class_id||'/%'"
+    "SELECT COUNT(*) count FROM photos WHERE deleted_at IS NULL " +
+    "AND r2_key NOT LIKE class_id||'/%' AND r2_key NOT LIKE 'originals/'||class_id||'/%'"
   ).first();
   return jsonResponse({
     jobs: Object.fromEntries((rows.results || []).map((row) => [row.status, Number(row.count || 0)])),
@@ -2055,6 +2337,7 @@ async function handleQueueBatch(batch, env) {
     try {
       payload = typeof message.body === "string" ? JSON.parse(message.body) : message.body;
       if (payload?.type === "photo.ingest") await processIngest(payload.photoId, env);
+      else if (payload?.type === "photo.variants") await processPhotoVariants(payload.photoId, env);
       else if (payload?.type === "search.run") await processFaceSearch(payload.taskId, env);
       else if (payload?.type === "face.delete") await deleteFaceEntity(payload.entityId, env);
       else if (payload?.type === "storage.delete") await processDeletionJob(payload.jobId, env);
@@ -2074,6 +2357,12 @@ async function handleQueueBatch(batch, env) {
       }
       message.retry({ delaySeconds: Math.min(300, 2 ** attempts) });
     }
+  }
+}
+
+async function sendQueueMessages(queue, payloads) {
+  for (let offset = 0; offset < payloads.length; offset += 100) {
+    await queue.sendBatch(payloads.slice(offset, offset + 100).map((body) => ({ body })));
   }
 }
 
@@ -2227,6 +2516,9 @@ function auditAction(request) {
   if (method === "POST" && path === "/api/admin/roles") return { name: "admin.role.create", sensitive: true };
   if (method === "PATCH" && /^\/api\/admin\/roles\/[^/]+$/.test(path)) return { name: "admin.role.update", sensitive: true };
   if (method === "DELETE" && /^\/api\/admin\/roles\/[^/]+$/.test(path)) return { name: "admin.role.delete", sensitive: true };
+  if (method === "PATCH" && path === "/api/admin/image-processing") {
+    return { name: "admin.image_processing.update", sensitive: true };
+  }
   if (method === "DELETE" && /^\/api\/admin\/(classes|photos)\/[^/]+$/.test(path)) return { name: "admin.force_delete", sensitive: true };
   return null;
 }
@@ -2255,6 +2547,100 @@ async function processIngest(photoId, env) {
     ).bind(photo.id, error instanceof Error ? error.message : String(error)).run();
     if (failed.meta?.changes) throw error;
   }
+}
+
+async function imageProcessingEnabled(env) {
+  const row = await env.DB.prepare(
+    "SELECT enabled FROM image_processing_settings WHERE id=1 LIMIT 1"
+  ).first();
+  return row ? Boolean(row.enabled) : true;
+}
+
+async function processPhotoVariants(photoId, env) {
+  if (!(await imageProcessingEnabled(env))) {
+    await env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='decline',error_message=''," +
+      "processed_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP " +
+      "WHERE photo_id=?1 AND queue_status IN ('queued','error')"
+    ).bind(photoId).run();
+    return;
+  }
+  const claim = await env.DB.prepare(
+    "UPDATE photo_upload_records SET queue_status='processing',error_message=''," +
+    "processing_started_at=COALESCE(processing_started_at,CURRENT_TIMESTAMP)," +
+    "updated_at=CURRENT_TIMESTAMP WHERE photo_id=?1 AND queue_status IN ('queued','error')"
+  ).bind(photoId).run();
+  if (!claim.meta?.changes) return;
+  const row = await env.DB.prepare(
+    "SELECT r.*,p.deleted_at FROM photo_upload_records r " +
+    "JOIN photos p ON p.id=r.photo_id WHERE r.photo_id=?1 LIMIT 1"
+  ).bind(photoId).first();
+  if (!row || row.deleted_at) {
+    await env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='error'," +
+      "error_message='Photo was removed before image processing',updated_at=CURRENT_TIMESTAMP " +
+      "WHERE photo_id=?1 AND queue_status='processing'"
+    ).bind(photoId).run();
+    return;
+  }
+  try {
+    if (!env.IMAGES) throw new Error("Images binding is unavailable");
+    if (Number(row.original_bytes || 0) > MAX_IMAGE_TRANSFORM_BYTES) {
+      throw new Error("Original exceeds the current Images binding input limit");
+    }
+    const previewBytes = await createImageVariant(
+      env,
+      row.original_key,
+      row.preview_key,
+      { width: 1600, fit: "scale-down" },
+      84,
+      photoId,
+      "preview"
+    );
+    const thumbnailBytes = await createImageVariant(
+      env,
+      row.original_key,
+      row.thumbnail_key,
+      { width: 520, fit: "scale-down" },
+      74,
+      photoId,
+      "thumbnail"
+    );
+    await env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='completed',preview_bytes=?2,thumbnail_bytes=?3," +
+      "total_bytes=original_bytes+?2+?3,error_message='',processed_at=CURRENT_TIMESTAMP," +
+      "updated_at=CURRENT_TIMESTAMP WHERE photo_id=?1 AND queue_status='processing'"
+    ).bind(photoId, previewBytes, thumbnailBytes).run();
+  } catch (error) {
+    await Promise.allSettled(
+      [row.preview_key, row.thumbnail_key].filter(Boolean).map((key) => env.PHOTO_BUCKET.delete(key))
+    );
+    const message = (error instanceof Error ? error.message : String(error)).slice(0, 500);
+    await env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status='error',preview_bytes=0,thumbnail_bytes=0," +
+      "total_bytes=original_bytes,error_message=?2,updated_at=CURRENT_TIMESTAMP " +
+      "WHERE photo_id=?1 AND queue_status='processing'"
+    ).bind(photoId, message).run();
+    throw error;
+  }
+}
+
+async function createImageVariant(env, originalKey, variantKey, transform, quality, photoId, kind) {
+  const original = await env.PHOTO_BUCKET.get(originalKey);
+  if (!original?.body) throw new Error("Original image object was not found");
+  const result = await env.IMAGES
+    .input(original.body)
+    .transform(transform)
+    .output({ format: "image/webp", quality, anim: false });
+  const response = result.response();
+  if (!response.ok || !response.body) {
+    throw new Error(`Images ${kind} transform failed with status ${response.status}`);
+  }
+  const stored = await env.PHOTO_BUCKET.put(variantKey, response.body, {
+    httpMetadata: { contentType: "image/webp" },
+    customMetadata: { purpose: kind, photoId, originalKey },
+  });
+  return Number(stored?.size || 0);
 }
 
 async function processFaceSearch(taskId, env) {
@@ -2536,8 +2922,23 @@ async function earliestClassPointer(classId, ownerId, env) {
 }
 
 async function physicallyDeletePhoto(photo, env) {
-  if (photo.r2_key) await env.PHOTO_BUCKET.delete(photo.r2_key);
+  const upload = await env.DB.prepare(
+    "SELECT id,preview_key,thumbnail_key,queue_status FROM photo_upload_records " +
+    "WHERE photo_id=?1 LIMIT 1"
+  ).bind(photo.id).first();
+  await Promise.allSettled(
+    [photo.r2_key, upload?.preview_key, upload?.thumbnail_key]
+      .filter(Boolean)
+      .map((key) => env.PHOTO_BUCKET.delete(key))
+  );
   await env.DB.batch([
+    env.DB.prepare(
+      "UPDATE photo_upload_records SET queue_status=CASE " +
+      "WHEN queue_status IN ('queued','processing') THEN 'error' ELSE queue_status END," +
+      "error_message=CASE WHEN queue_status IN ('queued','processing') " +
+      "THEN 'Photo was deleted before image processing completed' ELSE error_message END," +
+      "updated_at=CURRENT_TIMESTAMP WHERE photo_id=?1"
+    ).bind(photo.id),
     env.DB.prepare(
       "UPDATE app_users SET storage_used_bytes=MAX(0,COALESCE(storage_used_bytes,0)-" +
       "COALESCE((SELECT COALESCE(p.byte_size,p.size_bytes,0) FROM photos p WHERE p.id=?1),0))," +
@@ -2585,6 +2986,9 @@ async function processRekeyJob(jobId, env) {
   ).bind(job.target_id).first();
   if (!photo) return completeJob(job.id, env);
   if (photo.deleted_at) return completeJob(job.id, env);
+  if (photo.r2_key.startsWith(`originals/${photo.class_id}/`)) {
+    return completeJob(job.id, env);
+  }
   const newKey = `${photo.class_id}/${photo.id}.${trustedExtension(photo.content_type, photo.original_name)}`;
   if (photo.r2_key === newKey) {
     if (job.cursor && job.cursor !== newKey) await env.PHOTO_BUCKET.delete(job.cursor);
@@ -2628,8 +3032,9 @@ async function getPhoto(photoId, env, includeDeleted = false) {
   return env.DB.prepare(
     "SELECT p.*,COALESCE(p.byte_size,p.size_bytes,0) resolved_byte_size,c.name class_name," +
     "c.visibility,c.is_open,c.owner_user_id class_owner_user_id,c.deleted_at class_deleted_at," +
-    "c.delete_job_id class_delete_job_id " +
-    "FROM photos p JOIN photo_classes c ON c.id=p.class_id WHERE p.id=?1 " +
+    "c.delete_job_id class_delete_job_id,r.preview_key,r.thumbnail_key,r.queue_status variant_status " +
+    "FROM photos p JOIN photo_classes c ON c.id=p.class_id " +
+    "LEFT JOIN photo_upload_records r ON r.photo_id=p.id WHERE p.id=?1 " +
     (includeDeleted ? "" : "AND p.deleted_at IS NULL ") +
     "LIMIT 1"
   ).bind(photoId).first();
@@ -2752,6 +3157,55 @@ async function streamR2Object(request, env, key, options) {
   return new Response(request.method === "HEAD" ? null : object.body, { status, headers });
 }
 
+async function streamAuthorizedVariant(request, env, key, contentType) {
+  const cache = globalThis.caches?.default;
+  const origin = env.PUBLIC_APP_ORIGIN || "https://distribute.aryuki.com";
+  const cacheRequest = new Request(
+    `${origin}/__aryuki_variant_cache/v1/${encodeURIComponent(key)}`,
+    { method: "GET" }
+  );
+  let response = null;
+  if (cache) {
+    try {
+      response = await cache.match(cacheRequest);
+    } catch (error) {
+      console.warn("Variant edge cache read failed", error);
+    }
+  }
+  if (!response) {
+    const object = await env.PHOTO_BUCKET.get(key);
+    if (!object?.body) throw new HttpError("File not found", 404);
+    response = new Response(object.body, {
+      headers: {
+        "content-type": contentType,
+        "content-length": String(object.size),
+        etag: object.httpEtag,
+        "cache-control": "public, max-age=86400",
+      },
+    });
+    if (cache) {
+      try {
+        await cache.put(cacheRequest, response.clone());
+      } catch (error) {
+        console.warn("Variant edge cache write failed", error);
+      }
+    }
+  }
+  const headers = new Headers(response.headers);
+  headers.set("content-type", contentType);
+  headers.set("content-disposition", "inline");
+  headers.set("cache-control", "private, no-store");
+  headers.set("x-content-type-options", "nosniff");
+  headers.set("content-security-policy", "default-src 'none'; sandbox");
+  headers.set("cross-origin-resource-policy", "same-origin");
+  headers.delete("age");
+  headers.delete("cf-cache-status");
+  return new Response(request.method === "HEAD" ? null : response.body, {
+    status: response.status,
+    headers,
+  });
+}
+
 async function reserveStorage(user, addedBytes, env) {
   const result = await env.DB.prepare(
     "UPDATE app_users SET storage_used_bytes=COALESCE(storage_used_bytes,0)+?2,updated_at=CURRENT_TIMESTAMP " +
@@ -2862,6 +3316,10 @@ function publicShareDto(row) {
 
 function publicSharePhotoUrl(slug, photoId) {
   return `/api/public/shares/${encodeURIComponent(slug)}/photos/${encodeURIComponent(photoId)}/file`;
+}
+
+function publicSharePhotoThumbnailUrl(slug, photoId) {
+  return `/api/public/shares/${encodeURIComponent(slug)}/photos/${encodeURIComponent(photoId)}/thumbnail`;
 }
 
 function photoFileUrl(photoId) {
