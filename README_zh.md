@@ -1,210 +1,704 @@
-# PhotoFinder / Picture Distributor 项目说明
+# Aryuki Photo
 
-PhotoFinder 是一个基于 Cloudflare 的活动照片分发系统。当前生产域名：
+[English README](README.md)
 
-- `https://distribute.aryuki.com`
+Aryuki Photo 是一个面向活动摄影、按类分发图片、通过人脸查找本人图片的
+Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebody 人脸匹配、
+基于指针的「另存到自己」、按角色配置的存储空间、限时分享链接、个人主页背景，
+以及管理员控制台。
 
-## 主要功能
+生产地址：`https://distribute.aryuki.com`
 
-- 管理员创建、开放、关闭和删除照片类（Class）
-- 管理员批量上传照片，Cloudflare Queue 异步建立人脸索引
-- 使用阿里云 Facebody `AddFace` / `SearchFace` 进行人脸检索
-- 临时用户、AuthCenter 账号绑定和管理员登录
-- 桌面端调用浏览器摄像头，移动端调用前置摄像头拍摄自拍
-- 只搜索已开放类的类名搜索页面 `/search`
-- 原图预览、单张选择、整类选择、分别下载和 ZIP 下载
-- 人脸搜索历史与类名查询历史
-- 桌面端和移动端响应式页面，无横向溢出
-- 图片、类和历史记录删除前使用自定义确认弹窗
+本文只把仓库中已经实现的功能写成「当前能力」。文末的
+`originals / previews / thumbnails` 三层图片方案属于待实施迁移，不代表当前
+线上已经采用。
+
+## 产品原则
+
+- 业务中的 `class` 在全部中文界面和文档中统一称为「类」。
+- D1 是身份、权限、可见性、上传者、空间用量、另存指针、分享和任务状态的
+  唯一真相来源。
+- 每张原图只保存一次；另存和分享只增加引用，不复制原图。
+- 所有受保护图片都必须先由 Worker 根据 D1 鉴权，再读取 R2。
+- 人脸索引、人脸搜索、另存、删除和旧对象搬迁使用 Queue，能够安全重试。
+- 用户、角色、权限和空间用量始终绑定 Auth Center 稳定 UUID，不绑定
+  显示名或用户名，避免重名导致错配。
+- 电脑端和手机端共用一套设计系统，并分别适配导航、图片网格、弹窗、摄像头
+  和管理员页面。
+
+## 页面与路由
+
+| 路由 | 内容 |
+|---|---|
+| `/home` | Google 风格 Aryuki 首页、公开类搜索、相机入口、历史、语言、主题和账户入口 |
+| `/search?q=...` | 按相关度显示公开类；支持展开图片、选择、另存、预览和下载 |
+| `/selfie-recognition` | 电脑摄像头或手机前置相机上传、排队识别、结果、另存和下载 |
+| `/history` | 按时间倒序合并显示类搜索记录与自拍识别记录 |
+| `/save/` | 本人拥有的类、空间用量、类管理，以及按类归组的 Saved Photos |
+| `/share-link` | 新建、查看、修改、复制、停用和删除分享链接 |
+| `/s/:slug` | 可设置起止时间和密码的公共分享页 |
+| `/account` | 身份、Auth Center 绑定、主题、个人背景和 Bing 每日背景 |
+| `/admin` | 管理概览 |
+| `/admin/classes` | 所有类、上传者、张数、大小、公开状态、图片展开和强制删除 |
+| `/admin/users` | 用户、稳定身份、角色对应、实际权限和空间用量 |
+| `/admin/roles` | 角色增删改、默认角色、权限模式和空间上限 |
+| `/admin/audit` | 按用户归组的行动记录、对象、UUID、IP、国家码和敏感标记 |
+
+访问 `/` 会跳转到 `/home`。静态资源启用了 SPA 回退，直接打开任一前端路由
+也能正常加载。
+
+## 功能总览
+
+### 首页与类搜索
+
+- 首页采用公开 Google 首页的布局和交互作为参考，使用 Aryuki 自己的彩色标识。
+- 搜索栏只能直接发现 `public` 类。
+- 搜索记录展开后，点击搜索栏和记录框以外区域会关闭记录框。
+- 提交搜索时，Aryuki 标识和搜索栏平滑移动到紧凑结果顶栏；向下浏览结果时
+  只保留顶栏。
+- 搜索、存储、历史和识别结果网格读取缩略图；大图窗口和下载读取原图。
+
+支持的搜索语法：
+
+```text
+"毕业典礼"           完整短语
+-草稿                排除词
+高一 OR 高二         任意一组满足即可
+class:摄影           指定类名称关键词
+name:"Class 2026"    指定类名称短语
+before:2026-07-01    创建时间早于该日期
+after:2026-01-01     创建时间不早于该日期
+```
+
+输入最多 160 个字符，先做 Unicode NFKC 规范化，再按完全匹配、前缀、子串、
+完整词和词前缀排序。`name:` 与 `class:` 含义相同，因为目前唯一可搜索字段是
+类名称。
+
+### 人脸查找
+
+- 电脑端使用 `getUserMedia`，优先请求前置摄像头。
+- 手机端保留 `capture="user"` 的前置相机文件入口。
+- 已移除原来的上下扫描线和椭圆轮廓。
+- 自拍上传后写入 `search_tasks`，再发送到 `SEARCH_QUEUE`；服务端接受任务后，
+  用户可以离开页面。
+- Queue 从阿里云 Facebody 的实体 ID 找回 D1 图片，再根据当前权限重新过滤。
+- 页面不把不可靠的匹配值包装成对用户有保证的「准确度」。
+- 自拍识别和类搜索记录显示在同一个历史列表中，用标签区分，按时间倒序排列；
+  点击查看后向下展开缩略图。
+
+### 图片网格与悬浮窗口
+
+- 缩略图下方不显示文件名。
+- 点击缩略图后，以原图打开大图窗口。
+- 能读取到元数据时，大图窗口显示图片大小、尺寸、相机、拍摄时间、曝光时间、
+  光圈、ISO 和焦距；无元数据时至少显示大小。
+- 一次下载或另存超过 5 张图片时需要二次确认，但不使用红色警告。
+- 任何删除操作都需要红色二次确认。
+- 分享持续时间或图片量存在风险时使用红色警告。
+- 悬浮窗口打开时锁定底层页面滚动。电脑端居中；手机端确认框贴底向上出现，
+  且关闭按钮始终位于可操作区域。
+- 上传进度显示在右下角，可以通过向下箭头收起为悬浮圆形按钮。
+
+### 中英文、明暗主题与主页背景
+
+- `public/i18n.js` 支持中文和英文。
+- 语言与主题按钮固定在共享顶栏中。
+- 浅色、暗色模式都针对自定义图片背景调整了可见性。
+- 背景设置属于每个用户，管理入口位于 `/account`。
+- 自定义背景保留原图和一张 16:9 裁切图。
+- 删除自定义背景后有 30 分钟可恢复时间。
+- Bing 模式通过 `https://www.bing.com/HPImageArchive.aspx` 代理当天主页图片，
+  不把 Bing 图片保存到 R2。
+- 背景覆盖顶栏、主体和底部；已移除原先对整张自定义/Bing 背景的模糊。
 
 ## 系统架构
 
 ```mermaid
 flowchart LR
-  A[管理员上传] --> B[R2 原图]
-  B --> C[D1 photos]
-  C --> D[ingest-queue]
-  D --> E[Worker 消费者]
-  E --> F[阿里云 Facebody]
-
-  G[用户自拍] --> H[R2 自拍]
-  H --> I[D1 search_tasks]
-  I --> J[search-queue]
-  J --> K[Worker 消费者]
-  K --> L[Alibaba SearchFace]
-  L --> M[D1 匹配结果]
-  M --> N[前端轮询展示]
+  Browser["浏览器 SPA"] --> Worker["Cloudflare Worker"]
+  Worker --> Assets["静态资源"]
+  Worker --> D1["D1 权限与元数据"]
+  Worker --> KV["KV 公开类候选缓存"]
+  Worker --> R2["私有 R2 原图与临时输入"]
+  Worker --> Images["Cloudflare 图片转换绑定"]
+  Worker --> IQ["INGEST_QUEUE"]
+  Worker --> SQ["SEARCH_QUEUE"]
+  IQ --> Facebody["阿里云 Facebody"]
+  IQ --> D1
+  IQ --> R2
+  SQ --> Facebody
+  SQ --> D1
+  SQ --> R2
 ```
 
-核心服务：
+### 各组件职责
 
-- Cloudflare Workers：页面、API 和队列消费者
-- Cloudflare D1：照片元数据、类、会话和在线历史
-- Cloudflare R2：原始照片和自拍文件
-- Cloudflare Queues：上传索引和人脸查找任务
-- 阿里云 Facebody：人脸索引和检索
-- Aryuki AuthCenter：管理员登录和用户绑定
+| 组件 | 职责 |
+|---|---|
+| 浏览器 SPA | 前端路由、中英文界面、摄像/文件选择、图片选择、进度、弹窗和任务轮询 |
+| Worker 请求入口 | 会话、鉴权、API、R2 输出、静态安全响应头和发送 Queue |
+| Worker Queue 入口 | 人脸录入/搜索、另存指针、审计写入、删除、上传者转移和旧对象搬迁 |
+| D1 | 所有持久元数据和权限状态 |
+| R2 | 原始图片、临时自拍和个人背景文件 |
+| KV | 公开类候选 ID、名称和创建时间的 5 分钟缓存 |
+| Images 绑定 | 按需生成 520 px WebP 缩略图 |
+| 阿里云 Facebody | 人脸实体索引与搜索 |
+| Cron | 每 5 分钟恢复任务、重新排队和清理过期数据 |
 
-## 当前检索实现
+项目没有绑定 Cloudflare Vectorize。兼容字段 `photos.vector_id` 保存阿里云
+Facebody 实体 ID。
 
-`wrangler.toml` 仍保留 Vectorize 绑定，但生产环境的人脸检索实际使用阿里云 Facebody。
+## 身份与会话
 
-- `photos.vector_id` 保存阿里云 `EntityId`
-- 搜索结果按阿里云返回的 Score、Confidence 和质量阈值过滤
-- 前端不显示无法保证真实性的“相似度百分比”
-- 普通用户只能获得已开放类中的结果
+Aryuki Auth Center 是外部身份来源。Worker 验证回传 token 后，只保存稳定身份
+字段和本应用自己的不透明会话：
 
-## 页面
+- `auth_uuid` 是唯一、稳定的身份主键。
+- `auth_user_id`、`username`、显示名 `name`、邮箱和头像属于可在登录时刷新的
+  资料。
+- 页面主要显示 `username`，显示名或邮箱作为辅助信息。
+- 只有 Auth Center 回传邮箱时，`/account` 才显示邮箱已绑定信息。
+- 非管理员的用户菜单提供
+  `https://accounts.aryuki.com/<auth_uuid>` 个人详情入口。
+- 不在 D1 保存 Auth Center bearer token。
+- 普通应用会话有效 14 天。
+- 经过验证且明确属于 `picture-distributor` 的测试会话有效 30 分钟。
+- 除已验证的定向测试回调外，登录回调必须通过 state 校验。
 
-### `/`
+临时用户会获得本地会话，可以使用公开搜索、自拍识别和历史。上传、另存、分享
+和背景管理需要绑定 Auth Center。临时用户绑定后，原有历史会迁入稳定账号。
 
-主页面包含：
+管理员身份与可配置角色分开：
 
-- 管理员类与图片管理
-- 自拍拍摄/上传和人脸查找
-- 匹配结果预览、选择和下载
-- 顶部常驻 History 按钮、紧凑类名搜索框和用户名
+- `ADMIN_AUTH_UUIDS` 保存用逗号分隔、已经核验的 Auth Center UUID。
+- 数据库中已有管理员以同一个稳定 UUID 登录时仍保持管理员身份。
+- 用户名和显示名不能授予管理员权限。
 
-设备入口不读取浏览器 UA，而是根据指针、悬浮和触摸能力展示对应按钮：
+## 角色、权限与空间
 
-- 桌面设备：浏览器摄像头实时预览与拍照
-- 移动设备：`capture="user"` 调用前置摄像头
+系统始终只有一个默认角色，新绑定用户会自动获得它。
 
-### `/search`
+| 权限模式 | 可读范围 | 可写范围 | 空间信息 |
+|---|---|---|---|
+| `all_read` | 所有类 | 不可写 | 显示 |
+| `all_write` | 所有类 | 可创建和修改任何类/图片 | 显示 |
+| `own_write` | 公开、本人拥有、本人另存的内容 | 可创建类；可修改本人类/图片 | 显示 |
+| `own_read` | 公开和本人另存的内容 | 不可写；可以另存有权读取的内容 | 隐藏 |
 
-类名搜索仅查询 `is_open = 1` 的类，相关度顺序为：
+管理员会得到实际 `all_write` 权限，并额外拥有用户、角色、审计、对象搬迁和
+强制删除入口。
 
-1. 完全匹配
-2. 名称开头匹配
-3. 连续短语匹配
-4. 全部关键词匹配
-5. 部分关键词匹配
+空间使用十进制 GB：
 
-结果页展示类及其已建立索引的图片缩略图，支持：
+```text
+1 GB = 1,000,000,000 bytes
+```
 
-- 选择整个类
-- 选择部分图片
-- 分别下载
-- ZIP 下载
-- 点击缩略图打开原图
+- `roles.quota_bytes` 是角色空间上限。
+- `app_users.storage_used_bytes` 是当前计费用量。
+- 上限为 `0` 表示不限量。
+- 只计算当前归该用户所有的原图字节。
+- 另存指针、分享引用、自拍输入和 Bing 背景不会作为重复原图计费。
+- 上传前在 D1 原子预留空间；超过当前角色上限时，不会继续提交存储。
+- 为避免别人另存的内容消失，上传者转移允许接管者暂时超过上限；在释放空间
+  或管理员提高角色上限之前，新的上传会继续被拒绝。
 
-### `/history`
+## 类、图片与公开状态
 
-用于展示类名查询历史。
+`photo_classes` 是类模型；正常状态下，每张 `photos` 图片属于一个类。
 
-绑定 AuthCenter 的用户和管理员：
+- `public`：可通过首页类名称搜索发现，也能从公开结果读取。
+- `private`：不会进入公开搜索，但管理员、`all_read`/`all_write` 用户、上传者、
+  另存者以及持有有效分享链接的访问者仍可按权限读取。
+- 迁移兼容期保留 `is_open`：`1` 对应 `public`，`0` 对应 `private`；当前写入
+  会同步更新两个字段。
+- 修改类公开状态时只更新 SPA 局部状态，不刷新整个页面。
 
-- 记录在线写入 D1 并跨设备同步
-- 保存查询时间、结果数量和当时匹配的原图 ID
-- 历史只引用原图，不复制或额外保存图片文件
-- 图片被删除、未建立索引，或者所属类被关闭/删除后，缩略图显示为不可点击的灰色占位
+单次请求最多上传 100 张图片，每张最大 25 MiB。Worker 根据文件字节签名验证，
+不信任文件名或浏览器声明的类型。支持 JPEG、PNG、WebP、GIF、AVIF、HEIC、
+HEIF；拒绝可执行的 SVG。
 
-未绑定用户：
+元数据读取范围限制在文件头 512 KiB：
 
-- 查询记录保存在一年有效期的 Cookie 中
-- 只记录查询文字、时间和结果数量
-- 不展示历史缩略图
+- JPEG：尺寸与部分 EXIF；
+- PNG、GIF：尺寸；
+- 扩展 WebP：尺寸。
 
-两类用户都可以删除自己的历史记录。
+## ID 与当前 R2 目录
 
-## 响应式与交互
+新 ID 使用小写类型前缀，加上由 12 个加密安全随机字节生成的 16 位 base64url
+主体：
 
-- 页面、图片、卡片和菜单均限制在当前视口内
-- 手机端标题下方依次显示 History、紧凑搜索框和用户名
-- 用户详情窗口限制最大高度，内容过长时内部滚动
-- 点击用户详情窗口外任意位置会关闭窗口
-- 图片选择仅更新选择按钮，不重新渲染缩略图列表
-- 删除确认弹窗在桌面端居中显示
-- 手机端删除确认弹窗位于底部并从下向上进入，四角均为圆角
-- 打开确认弹窗时锁定底层页面滚动
+```text
+c_xdPr4EyB1q6YzZk9
+p_e2P5CHFMf7pPM2y_
+```
 
-## 删除语义
+随机主体为 96 bit。常见前缀包括 `u_`、`c_`、`p_`、`task_`、`hist_`、
+`bg_`、`save_`、`link_`、`role_`、`job_`、`audit_`、`ses_`。
+`c_past000000000000` 是唯一一个旧数据迁移固定 ID 例外。
 
-删除照片会：
+当前 R2 key：
 
-1. 删除对应阿里云人脸实体
-2. 删除 R2 原图
-3. 删除 D1 照片记录
+```text
+<class-id>/<photo-id>.<规范化扩展名>
+temp/selfies/<task-id>.<规范化扩展名>
+backgrounds/<user-id>/<background-id>-original.<扩展名>
+backgrounds/<user-id>/<background-id>-cropped.<扩展名>
+```
 
-删除类会逐张清理类内照片，再删除类记录。图片、类和历史记录删除均需要在红色确认按钮的自定义弹窗中确认。
+必须以数据库 `r2_key` 为准，不能根据 ID 猜已有对象路径，因为旧对象可能仍在
+原路径中。
+
+## 当前图片加载方式
+
+以下是本仓库目前已经实现的行为：
+
+1. `/api/photos/:id/thumbnail` 先鉴权，再从私有 R2 读取原图。
+2. 存在 `IMAGES` 绑定时，Worker 按需输出宽 520 px、质量 74 的 WebP。
+3. 公开缩略图缓存策略为
+   `public, max-age=3600, stale-while-revalidate=86400`。
+4. 受保护缩略图为 `private, max-age=300`。
+5. 图片转换失败或没有绑定时，回退到已经鉴权的原图。
+6. `/api/photos/:id/file` 输出原图并支持字节范围。
+7. 公开原图只缓存 60 秒并重新验证；受保护原图为 `private, no-store`。
+
+当前**没有**把生成后的预览图和缩略图保存为 R2 对象。公共分享网格目前也仍把
+经过鉴权的原图接口当作缩略图地址。这两项属于后续迁移目标。
+
+## 待实施的三层图片方案
+
+将私有 R2 规划为以下结构是合理的，也能保留现有权限模型：
+
+```text
+originals/<class-id>/<photo-id>.<扩展名>
+previews/<class-id>/<photo-id>/<版本>.webp
+thumbnails/<class-id>/<photo-id>/<版本>.webp
+temp/...
+backgrounds/...
+```
+
+计划中的不变量：
+
+- 原图保持不可变，只在大图查看或下载时输出。
+- 缩略图和预览图在上传后由 Queue 消费者生成。
+- D1 记录原图/变体 key、尺寸、格式、字节数、版本和生成状态。
+- 每次请求必须先在 D1 鉴权，再查 Edge Cache 或 R2。
+- Edge Cache 只缓存变体图片字节，不缓存「某用户有权限」这一判断。
+- 缓存 key 包含图片 ID、变体类型和不可变版本/ETag，替换图片不会命中旧内容。
+- 类从 `public` 改为 `private` 后仍不会泄漏缓存，因为私有 R2 只能经过 Worker，
+  且 Worker 在查缓存前先鉴权。
+- 删除图片时同时删除所有变体；仅转移上传者时保留变体，因为底层图片未变。
+- 在全量回填完成前，保留当前按需转换接口作为回退。
+
+建议执行顺序：
+
+1. 先增加 `image_variants` 表或等价字段，不修改现有读取路径。
+2. 在上传索引 Queue 中生成 thumbnail 和 preview。
+3. 实现带版本的内部缓存 key，以及统一的「先鉴权、后缓存」输出函数。
+4. 通过有上限的 Queue 批次为现有有效图片回填变体。
+5. 图片网格改用 thumbnail；大图窗口默认 preview；下载和明确查看原图时才读取
+   original。
+6. 公共分享也改用同一套变体接口。
+7. 监控缓存命中率、转换失败、R2 读取次数和变体占用空间。
+8. 只有回填完成、回退指标稳定后，才考虑移除按需转换。
+
+此方案会让每张照片增加两个体积较小的对象，以少量 R2 对象数和空间换取更少的
+重复转换与更快的图片网格加载。
+
+## 「另存到自己」与删除规则
+
+`saved_classes`、`saved_photos` 都指向唯一原图。创建另存会发送
+`pointer.save`，接口返回 HTTP `202`。
+
+必须满足以下规则：
+
+1. 另存不复制 R2 对象，也不增加计费用量。
+2. 非上传者删除时，只删除自己的指针。
+3. 上传者普通删除时，目标先被软隐藏，并创建唯一、幂等的 `deletion_jobs`。
+4. Queue 消费者重新读取任务，并核对 `expected_owner_user_id`。
+5. 存在有效指针时，按 `(created_at, user_id)` 选择最早指针成为新上传者，
+   对应字节也转移给新上传者。
+6. 删除类时，若只有单图指针保住某张图片，使用 `class_removed_at` 让它脱离
+   原类、搜索和按类分享，但新上传者仍保留独立图片。
+7. 没有有效指针时，才删除阿里云实体、R2 对象、D1 行并释放空间。
+8. 历史和分享引用不能保留上传者资格。
+9. 管理员强制删除忽略指针并直接物理删除。所有读取路径都必须容忍 D1 行或
+   R2 对象已经不存在。
+
+任务状态为 `pending -> processing -> completed|failed`。同一个
+`(kind, target_id)` 最多只有一个活动任务，因此 Queue 重复投递不会重复扣减
+或重复转移。
+
+## 分享链接
+
+分享链接可以同时引用整个类和单张图片，但不会复制图片文件。
+
+- 自定义后缀为 3-64 位小写字母、数字、连字符或下划线。
+- 可选开始与结束时间。
+- 状态为 `active` 或 `disabled`。
+- 最多选择 500 个类和 1,000 张图片。
+- 选择整个类时，动态包含其中当前仍可用的图片。
+- 图片被删除或脱离原类后，会自动从相应分享中不可见。
+
+密码规则：
+
+- 最少 6 个字符。
+- 验证使用随机盐和带服务端密钥的单向哈希。
+- 分享所有者查看明文密码时，使用单独保存的加密密文。
+- 创建、验证、解密或修改带密码分享都需要 `SHARE_PASSWORD_KEY`。
+- 同一网络和分享每 10 分钟最多尝试 5 次密码。
+- 分享会话 token 在数据库中只保存哈希，最长有效 12 小时，并且不会超过分享
+  结束时间。
+
+## Queue、恢复与保留时间
+
+`INGEST_QUEUE` 处理：
+
+- `photo.ingest`
+- `face.delete`
+- `storage.delete`
+- `storage.rekey`
+- `pointer.save`
+- `audit.write`
+
+`SEARCH_QUEUE` 处理 `search.run`。
+
+消费者批次大小为 1，Cloudflare 重试 3 次；Worker 还会给失败消息设置指数
+退避，并配置独立死信队列。D1 任务行始终是持久状态来源。
+
+每 5 分钟 Cron 会：
+
+- 将卡住超过 15 分钟的图片索引、人脸搜索或删除任务恢复为可重试状态；
+- 重新发送待处理任务；
+- 在完成/失败 24 小时后清理自拍输入，最迟不超过 7 天；
+- 临时用户搜索历史保留 7 天；
+- 已绑定用户的搜索与自拍历史保留 90 天；
+- 清理过期应用会话、分享会话和限流桶；
+- 30 分钟恢复期结束后永久删除旧背景文件；
+- 临时用户超过 30 天未活动且没有任何关联数据时，清理该用户。
+
+设置 `RETRY_FAILED_JOBS=true` 后，Cron 也会重新发送失败的删除任务。
+
+## 管理员与审计
+
+管理员控制台包含：
+
+- 类、有效类、图片、用户、字节数、有效分享和待处理任务总览；
+- 每个类的上传者、张数、大小、公开状态和可展开图片；
+- 用户和角色对应、实际空间上限与用量；
+- 角色新建、修改、删除、排序和默认角色；
+- 重新发送失败的人脸索引；
+- 可恢复的旧 R2 key 搬迁；
+- 强制删除类或图片；
+- 按用户归组的审计记录。
+
+可审计请求成功后，记录通过 Queue 写入。每条包含本地用户 ID、Auth Center
+UUID、行动名、IP、二字国家码、敏感标记、对象类型/ID/名称/数量和时间。
+删除等敏感行为红色显示。手机空间不足时 UUID、IP 和对象名可以折叠，但仍可
+复制完整内容。
+
+## D1 数据模型
+
+| 表 | 用途 |
+|---|---|
+| `roles` | 权限模式、空间上限、默认/系统标记和排序 |
+| `app_users` | Auth Center 稳定身份、资料、角色、管理员标记和计费用量 |
+| `app_sessions` | 本应用不透明会话 |
+| `photo_classes` | 类名称、介绍、上传者、公开状态和删除状态 |
+| `photos` | R2 key、上传者、所属类、大小、元数据、人脸实体、索引和删除状态 |
+| `saved_classes` | 用户到类的另存指针 |
+| `saved_photos` | 用户到图片的另存指针 |
+| `deletion_jobs` | 幂等删除与对象搬迁任务 |
+| `search_tasks` | 自拍输入、任务状态、顺序匹配结果和分数 |
+| `class_search_history` | 类搜索文字及结果图片引用 |
+| `share_links` | 所有者、后缀、有效期、密码材料和状态 |
+| `share_link_classes` | 分享到类的引用 |
+| `share_link_photos` | 分享到图片的引用 |
+| `share_sessions` | 哈希后的临时解锁会话 |
+| `user_backgrounds` | 背景模式、原图/裁切图和恢复状态 |
+| `audit_logs` | 行动人、网络、行动、敏感标记和处理对象 |
+| `rate_limit_buckets` | D1 固定窗口限流计数 |
+
+旧字段 `role`、`is_open`、`size_bytes`、`matched_urls` 等会保留到所有已部署
+版本都停止读取为止。
+
+## API 概览
+
+### 身份
+
+```text
+GET  /api/me
+GET  /api/auth/login-url
+POST /api/auth/temp
+POST /api/logout
+GET  /sso-callback[/<mode>]
+```
+
+### 类、图片与搜索
+
+```text
+GET|POST          /api/classes
+GET|PATCH|DELETE  /api/classes/:id
+GET|POST          /api/classes/:id/photos
+GET                /api/class-search
+GET|POST           /api/class-search-history
+POST               /api/search
+GET                /api/status/:taskId
+GET                /api/history
+DELETE             /api/history/:type/:id
+GET                /api/selfies/:taskId/file
+GET                /api/photos/:id/thumbnail
+GET                /api/photos/:id/file
+DELETE             /api/photos/:id
+```
+
+### 存储、背景与另存
+
+```text
+GET         /api/storage
+GET         /api/saved
+POST|DELETE /api/saved/classes/:id
+POST|DELETE /api/saved/photos/:id
+GET|POST|DELETE /api/background
+POST        /api/background/mode
+POST        /api/background/restore
+GET         /api/background/file
+GET         /api/background/bing
+```
+
+### 分享
+
+```text
+GET|POST           /api/share-links
+GET|PATCH|DELETE   /api/share-links/:id
+GET                /api/public/shares/:slug
+POST               /api/public/shares/:slug/unlock
+GET                /api/public/shares/:slug/photos/:photoId/file
+```
+
+### 管理员
+
+```text
+GET          /api/admin/overview
+GET          /api/admin/classes
+GET          /api/admin/users
+PATCH        /api/admin/users/:id
+GET|POST     /api/admin/roles
+PATCH|DELETE /api/admin/roles/:id
+GET          /api/admin/audit
+POST         /api/admin/retry-ingest
+DELETE       /api/admin/classes/:id
+DELETE       /api/admin/photos/:id
+POST         /api/admin/storage/rekey
+GET          /api/admin/storage/rekey/status
+```
+
+为旧版本兼容，仍保留 `POST /api/admin/photos` 和 `/api/query-history`。
 
 ## 仓库结构
 
-当前生产入口：
-
-- `worker/index.js`：Worker 路由、API 和队列消费者
-- `worker/homepage3.js`：主页面
-- `worker/searchpage.js`：类名搜索结果页
-- `worker/historypage.js`：类名查询历史页
-- `wrangler.toml`：Cloudflare 配置与资源绑定
-- `schema.sql`：完整 D1 表结构
-
-数据库迁移：
-
-- `migrate-auth-classes.sql`
-- `migrate-search-history.sql`
-- `migrate-class-search-history.sql`
-- `migrate-class-search-results.sql`
-
-以下文件是旧实现或草稿，不是当前生产入口：
-
-- `App.tsx`
-- `api-worker.js`
-- `consumer-worker.js`
-- `worker/homepage.js`
-- `worker/homepage2.js`
-
-## Cloudflare 资源
-
-- Worker：`picture-distributor`
-- D1：`picture-distributor-db`
-- R2：`picture-distributor-save`
-- Queue：`ingest-queue`
-- Queue：`search-queue`
-- Vectorize：`picture-distributor-vector`（当前人脸搜索未使用）
-
-## 本地检查与部署
-
-语法检查：
-
-```bash
-node --check worker/index.js
-node --check worker/homepage3.js
-node --check worker/searchpage.js
-node --check worker/historypage.js
+```text
+public/
+  index.html          SPA 外壳
+  app.js              页面路由、渲染和交互
+  client.js           API、超时和上传进度
+  i18n.js             中英文翻译层
+  search-syntax.js    浏览器端搜索语法
+  styles.css          设计 token、响应式布局、弹窗和图片网格
+worker/
+  index.js            请求、API、Queue、Cron、鉴权和存储逻辑
+  lib/
+    alibaba.js        Facebody 接入
+    ids.js            96-bit 带类型 ID
+    image-metadata.js 安全的文件头和 EXIF 提取
+    passwords.js      分享密码哈希与加密
+    search-query.js   服务端搜索解析与排序
+migrations/           已有数据库的增量升级
+schema.sql            全新 D1 的完整结构
+design-research/      参考图与视觉检查截图
+wrangler.toml         Worker 域名、绑定、Queue 和 Cron
 ```
 
-首次登录：
+`.gitignore` 已排除本地输出、测试目录、构建/部署缓存、环境文件、凭据和各种
+secret 文件。
+
+## Cloudflare 绑定与配置
+
+`wrangler.toml` 定义：
+
+| 绑定 | 服务 |
+|---|---|
+| `ASSETS` | 静态 SPA |
+| `DB` | D1 |
+| `PHOTO_BUCKET` | 私有 R2 |
+| `SEARCH_CACHE` | 公开类候选 KV 缓存 |
+| `IMAGES` | 图片转换 |
+| `INGEST_QUEUE` | 索引、删除、另存和审计 Queue |
+| `SEARCH_QUEUE` | 人脸搜索 Queue |
+
+配置还包含生产自定义域、每 5 分钟的 Cron，以及两条生产 Queue 各自的死信队列。
+
+非敏感变量包括公开地址、Auth Center 地址和应用 ID、管理员 UUID 白名单、
+阿里云端点/区域/人脸库/API 版本及匹配限制。
+
+生产环境必须设置：
 
 ```bash
-npx wrangler login
+npx wrangler secret put ALIBABA_ACCESS_KEY_ID
+npx wrangler secret put ALIBABA_ACCESS_KEY_SECRET
+npx wrangler secret put SHARE_PASSWORD_KEY
 ```
 
-执行数据库迁移：
+`SHARE_PASSWORD_KEY` 应使用独立、高随机度的值。Auth Center 测试登录 secret、
+Cloudflare 凭据、API key、资源导出、`.dev.vars` 和本地 secret 文件都不能
+写入源码、前端、日志或文档。
+
+## 本地开发
+
+要求：
+
+- Node.js 22.5 或更高版本；
+- npm；
+- 需要操作远端资源或部署时，准备 Cloudflare 账号并完成 Wrangler 登录。
+
+安装依赖：
 
 ```bash
-npx wrangler d1 execute picture-distributor-db --remote --file=migrate-class-search-history.sql
-npx wrangler d1 execute picture-distributor-db --remote --file=migrate-class-search-results.sql
+npm ci
 ```
 
-部署：
+仅本地开发时，可以在已忽略的 `.dev.vars` 中写变量名和本地值，但不得提交：
+
+```text
+ALIBABA_ACCESS_KEY_ID=...
+ALIBABA_ACCESS_KEY_SECRET=...
+SHARE_PASSWORD_KEY=...
+```
+
+创建本地 D1 并启动：
 
 ```bash
+npx wrangler d1 execute picture-distributor-db --local --file=schema.sql
+npm run dev
+```
+
+本地 Cloudflare 状态位于已忽略的 `.wrangler/`。
+
+## 全新数据库与迁移
+
+### 全新数据库
+
+只应用完整 schema：
+
+```bash
+npx wrangler d1 execute picture-distributor-db --remote --file=schema.sql
+```
+
+全新数据库不要再次执行旧库 migration。
+
+### 已有数据库
+
+执行任何远端写入前，先查看迁移状态并导出备份：
+
+```bash
+npx wrangler d1 migrations list picture-distributor-db --remote
+npx wrangler d1 export picture-distributor-db --remote --output=backup-before-migration.sql
+```
+
+暂停上传，按计划部署兼容代码，再执行增量 migration：
+
+```bash
+npx wrangler d1 migrations apply picture-distributor-db --remote
+```
+
+迁移记录：
+
+| 文件 | 内容 |
+|---|---|
+| `0001_product_model.sql` | 角色、空间、上传者、公开状态、另存指针、分享、删除/搬迁任务、匹配分数和索引 |
+| `0002_legacy_photos_to_past.sql` | 将没有上传者的旧图片归入私有 `past`，指定最早管理员、重算用量，不修改 R2 key |
+| `0003_own_read_backgrounds.sql` | 增加类介绍，以及初始自定义背景/恢复表 |
+| `0004_background_share_audit.sql` | 增加背景模式、分享密码加密显示材料和审计表 |
+| `0005_photo_metadata_audit_targets_email.sql` | 增加邮箱、图片元数据和审计对象字段 |
+
+重要升级检查：全新 schema 支持 `own_read`。如果旧数据库最初通过 migration
+`0001` 创建，`roles.access_mode` 可能仍只有三个允许值，因为 migration `0003`
+并没有重建 `roles` 表。给角色设置 `own_read` 前，必须检查 `sqlite_schema`；
+若仍是旧约束，应先编写并评审专门的表重建 migration，不能直接假设已经支持。
+
+旧图片迁移使用固定类 ID `c_past000000000000`，默认设为 `private`，上传者为
+最早的管理员，而且不移动 R2 对象。迁空的旧类会软删除并保留审计痕迹。
+
+元数据迁移完成后，管理员可以启动可恢复的对象 key 规范化：
+
+```text
+POST /api/admin/storage/rekey
+GET  /api/admin/storage/rekey/status
+```
+
+每个 `rekey_photo` 任务按「复制到规范 key、更新 D1、再删除旧对象」执行。
+
+## 测试与部署
+
+运行语法检查和本地测试：
+
+```bash
+npm run check
+```
+
+当前 `node:test` 覆盖：
+
+- 96-bit 带类型 ID；
+- 服务端和浏览器搜索语法；
+- 英文翻译与动态数量；
+- 图片元数据签名；
+- 带服务端密钥的分享密码验证和仅所有者可解密；
+- 全新 schema 与默认角色；
+- 旧图片到 `past` 的迁移；
+- Wrangler 静态资源、KV、任务恢复、死信队列和无 Vectorize 配置；
+- 可选数字参数默认值；
+- 图片字节签名、拒绝 SVG；
+- Unicode 下载文件名；
+- 仅接受经过验证、属于本应用的测试回调。
+
+部署前检查并部署：
+
+```bash
+npm run deploy:check
 npx wrangler deploy
 ```
 
-## 重要环境变量
+部署后检查：
 
-- `PUBLIC_APP_ORIGIN`
-- `APP_ID`
-- `AUTH_CENTER_ORIGIN`
-- `ADMIN_USERNAMES`
-- `ALIBABA_ACCESS_KEY_ID`（Secret）
-- `ALIBABA_ACCESS_KEY_SECRET`（Secret）
-- `ALIBABA_DB_NAME`
-- `ALIBABA_SCORE_THRESHOLD`
-- `ALIBABA_CONFIDENCE_THRESHOLD`
-- `ALIBABA_QUALITY_SCORE_THRESHOLD`
-- `ALIBABA_SEARCH_LIMIT`
+1. 确认线上静态资源版本和 `/api/me`；
+2. 使用新生成、明确属于本应用的 Auth Center 测试登录，不记录 secret；
+3. 分别检查电脑/手机、中文/英文、浅色/暗色；
+4. 测试公开/私有搜索、人脸识别、历史展开、原图大图、另存 Queue、上传索引
+   Queue、分享密码、账户背景、空间上限和管理员审计；
+5. 确认页面没有横向滚动，所有悬浮窗口都会锁定底层页面；
+6. 查看 Queue 失败情况和两条死信队列。
 
-Secret 不应写入仓库，应使用 Wrangler Secret 管理。
+## 安全与运维不变量
+
+- 所有修改数据的请求必须同源。
+- 应用会话、分享解锁 token、背景恢复 token 按各自用途使用 Secure、HttpOnly
+  或哈希保存。
+- 受保护对象不能通过公开 R2 地址访问。
+- 每次受保护读取都要根据 D1 重新判断权限。
+- KV 不保存任何权限真相。
+- 根据字节签名验证图片，拒绝 SVG 和声明类型不一致的文件。
+- 文件响应使用安全的 Unicode `Content-Disposition`、`nosniff`、沙箱 CSP、
+  同源资源策略和字节范围。
+- 静态响应包含 CSP、禁止嵌入、引用来源、浏览器权限和内容类型保护。
+- Queue 消息只携带稳定 ID；进行破坏性操作前，消费者重新读取 D1。
+- 空间用量随上传者转移，不随显示名、用户名、另存次数或分享次数变化。
+- 真实 secret 不得提交，也不能粘贴到 issue、README、前端、截图或命令记录。
+
+## 视觉参考
+
+`design-research/google-home-2026-07-27.png` 记录了用于研究间距和交互的公开
+Google 首页。Aryuki Photo 使用自己的标识、内容、导航和业务行为。
+
+其余 `design-research/qa-*.png` 记录电脑端、手机端、暗黑模式、英文版、搜索
+动效、自拍、历史和管理员页面检查结果，只作为视觉检查证据，不是运行依赖。

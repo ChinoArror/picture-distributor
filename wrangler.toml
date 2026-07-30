@@ -11,10 +11,7 @@ PUBLIC_APP_ORIGIN = "https://distribute.aryuki.com"
 PUBLIC_R2_BASE_URL = ""
 APP_ID = "picture-distributor"
 AUTH_CENTER_ORIGIN = "https://accounts.aryuki.com"
-ADMIN_USERNAMES = "admin"
-VECTOR_DIMENSIONS = "512"
-VECTOR_TOP_K = "48"
-VECTOR_MATCH_THRESHOLD = "0.78"
+ADMIN_AUTH_UUIDS = ""
 ALIBABA_ENDPOINT = "https://facebody.cn-shanghai.aliyuncs.com"
 ALIBABA_REGION_ID = "cn-shanghai"
 ALIBABA_DB_NAME = "default"
@@ -25,10 +22,26 @@ ALIBABA_CONFIDENCE_THRESHOLD = "72.62"
 ALIBABA_MAX_FACES = "1"
 ALIBABA_QUALITY_SCORE_THRESHOLD = "50"
 
+[assets]
+directory = "./public"
+binding = "ASSETS"
+not_found_handling = "single-page-application"
+run_worker_first = true
+
+[images]
+binding = "IMAGES"
+
+[triggers]
+crons = ["*/5 * * * *"]
+
 [[d1_databases]]
 binding = "DB"
 database_name = "picture-distributor-db"
 database_id = "b54a3c30-327e-4e07-81bb-303caf1dff7f"
+
+[[kv_namespaces]]
+binding = "SEARCH_CACHE"
+id = "1d86df1ec4f74090961c0d28a246cd59"
 
 [[r2_buckets]]
 binding = "PHOTO_BUCKET"
@@ -46,12 +59,12 @@ queue = "search-queue"
 queue = "ingest-queue"
 max_batch_size = 1
 max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "picture-distributor-ingest-dlq"
 
 [[queues.consumers]]
 queue = "search-queue"
 max_batch_size = 1
 max_batch_timeout = 5
-
-[[vectorize]]
-binding = "PHOTO_VECTOR_INDEX"
-index_name = "picture-distributor-vector"
+max_retries = 3
+dead_letter_queue = "picture-distributor-search-dlq"

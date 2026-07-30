@@ -1,0 +1,8 @@
+ALTER TABLE app_users ADD COLUMN email TEXT NOT NULL DEFAULT '';
+
+ALTER TABLE photos ADD COLUMN metadata_json TEXT NOT NULL DEFAULT '{}';
+
+ALTER TABLE audit_logs ADD COLUMN target_kind TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN target_id TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN target_name TEXT NOT NULL DEFAULT '';
+ALTER TABLE audit_logs ADD COLUMN target_count INTEGER NOT NULL DEFAULT 0 CHECK (target_count >= 0);
