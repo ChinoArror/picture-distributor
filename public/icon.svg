@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Aryuki Photos">
+  <defs>
+    <linearGradient id="background" x1="72" y1="48" x2="440" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#eef3ff"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="150%">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#243b7a" flood-opacity=".18"/>
+    </filter>
+  </defs>
+  <rect x="24" y="24" width="464" height="464" rx="112" fill="url(#background)"/>
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round" filter="url(#shadow)">
+    <path d="M132 382 246 126" stroke="#4285f4" stroke-width="62"/>
+    <path d="m266 126 114 256" stroke="#ea4335" stroke-width="62"/>
+    <path d="M184 286h144" stroke="#34a853" stroke-width="54"/>
+  </g>
+  <circle cx="256" cy="126" r="31" fill="#fbbc05"/>
+</svg>

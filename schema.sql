@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS app_users (
   id TEXT PRIMARY KEY,
   kind TEXT NOT NULL CHECK (kind IN ('admin', 'auth', 'temp')),
   role TEXT NOT NULL DEFAULT 'user' CHECK (role IN ('admin', 'user')), -- legacy compatibility
-  role_id TEXT NOT NULL DEFAULT 'role_default',
+  role_id TEXT,
   storage_used_bytes INTEGER NOT NULL DEFAULT 0 CHECK (storage_used_bytes >= 0),
   auth_uuid TEXT UNIQUE,
   auth_user_id INTEGER,
@@ -50,6 +50,19 @@ CREATE TABLE IF NOT EXISTS app_users (
 CREATE INDEX IF NOT EXISTS idx_app_users_auth_uuid ON app_users(auth_uuid);
 CREATE INDEX IF NOT EXISTS idx_app_users_role ON app_users(role);
 CREATE INDEX IF NOT EXISTS idx_app_users_role_id ON app_users(role_id);
+
+CREATE TRIGGER IF NOT EXISTS trg_app_users_assign_default_role
+AFTER INSERT ON app_users
+FOR EACH ROW
+WHEN NEW.role_id IS NULL AND NEW.kind != 'temp'
+BEGIN
+  UPDATE app_users
+  SET role_id = CASE
+    WHEN NEW.role = 'admin' THEN 'role_admin'
+    ELSE (SELECT id FROM roles WHERE is_default = 1 LIMIT 1)
+  END
+  WHERE id = NEW.id;
+END;
 
 CREATE TABLE IF NOT EXISTS app_sessions (
   id TEXT PRIMARY KEY,
@@ -108,10 +121,44 @@ CREATE INDEX IF NOT EXISTS idx_photo_classes_owner ON photo_classes(owner_user_i
 CREATE INDEX IF NOT EXISTS idx_photo_classes_visibility_name
   ON photo_classes(visibility, deleted_at, name COLLATE NOCASE);
 
+-- Physical image objects created after the SHA-256 deduplication rollout.
+-- Historical photos keep asset_id NULL and retain their existing R2 keys.
+CREATE TABLE IF NOT EXISTS photo_assets (
+  id TEXT PRIMARY KEY,
+  hash_algorithm TEXT NOT NULL DEFAULT 'sha256' CHECK (hash_algorithm = 'sha256'),
+  physical_owner_user_id TEXT NOT NULL,
+  original_key TEXT NOT NULL UNIQUE,
+  preview_key TEXT NOT NULL DEFAULT '',
+  thumbnail_key TEXT NOT NULL DEFAULT '',
+  content_type TEXT NOT NULL,
+  original_bytes INTEGER NOT NULL DEFAULT 0 CHECK (original_bytes >= 0),
+  preview_bytes INTEGER NOT NULL DEFAULT 0 CHECK (preview_bytes >= 0),
+  thumbnail_bytes INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_bytes >= 0),
+  total_bytes INTEGER NOT NULL DEFAULT 0 CHECK (total_bytes >= 0),
+  object_status TEXT NOT NULL DEFAULT 'uploading'
+    CHECK (object_status IN ('uploading', 'ready', 'error')),
+  image_status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (image_status IN ('queued', 'processing', 'completed', 'decline', 'error')),
+  facial_status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (facial_status IN ('queued', 'processing', 'completed', 'error')),
+  image_error_message TEXT NOT NULL DEFAULT '',
+  facial_error_message TEXT NOT NULL DEFAULT '',
+  vector_id TEXT UNIQUE,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  FOREIGN KEY (physical_owner_user_id) REFERENCES app_users(id) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_photo_assets_owner
+  ON photo_assets(physical_owner_user_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_photo_assets_object_status
+  ON photo_assets(object_status, updated_at);
+
 CREATE TABLE IF NOT EXISTS photos (
   id TEXT PRIMARY KEY,
   class_id TEXT NOT NULL,
   owner_user_id TEXT NOT NULL,
+  asset_id TEXT,
   r2_key TEXT NOT NULL UNIQUE,
   original_name TEXT NOT NULL,
   content_type TEXT NOT NULL,
@@ -131,6 +178,7 @@ CREATE TABLE IF NOT EXISTS photos (
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (class_id) REFERENCES photo_classes(id) ON DELETE RESTRICT,
   FOREIGN KEY (owner_user_id) REFERENCES app_users(id) ON DELETE RESTRICT,
+  FOREIGN KEY (asset_id) REFERENCES photo_assets(id) ON DELETE SET NULL,
   FOREIGN KEY (delete_job_id) REFERENCES deletion_jobs(id) ON DELETE SET NULL
 );
 
@@ -140,6 +188,10 @@ CREATE INDEX IF NOT EXISTS idx_photos_class_id
   ON photos(class_id, class_removed_at, deleted_at, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photos_owner ON photos(owner_user_id, deleted_at, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photos_vector_id ON photos(vector_id);
+CREATE INDEX IF NOT EXISTS idx_photos_asset_id
+  ON photos(asset_id, deleted_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_photos_class_asset_active
+  ON photos(class_id, asset_id) WHERE asset_id IS NOT NULL AND deleted_at IS NULL;
 
 CREATE TABLE IF NOT EXISTS image_processing_settings (
   id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -156,6 +208,7 @@ ON CONFLICT(id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS photo_upload_records (
   id TEXT PRIMARY KEY,
   photo_id TEXT UNIQUE,
+  asset_id TEXT,
   uploader_user_id TEXT,
   uploader_auth_uuid TEXT NOT NULL DEFAULT '',
   uploader_name TEXT NOT NULL DEFAULT '',
@@ -171,14 +224,20 @@ CREATE TABLE IF NOT EXISTS photo_upload_records (
   preview_bytes INTEGER NOT NULL DEFAULT 0 CHECK (preview_bytes >= 0),
   thumbnail_bytes INTEGER NOT NULL DEFAULT 0 CHECK (thumbnail_bytes >= 0),
   total_bytes INTEGER NOT NULL DEFAULT 0 CHECK (total_bytes >= 0),
+  occupied_bytes INTEGER NOT NULL DEFAULT 0 CHECK (occupied_bytes >= 0),
+  is_deduplicated INTEGER NOT NULL DEFAULT 0 CHECK (is_deduplicated IN (0, 1)),
   queue_status TEXT NOT NULL DEFAULT 'queued'
     CHECK (queue_status IN ('queued', 'processing', 'completed', 'decline', 'error')),
   error_message TEXT NOT NULL DEFAULT '',
+  facial_status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (facial_status IN ('queued', 'processing', 'completed', 'error')),
+  facial_error_message TEXT NOT NULL DEFAULT '',
   uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   processing_started_at TEXT,
   processed_at TEXT,
   updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   FOREIGN KEY (photo_id) REFERENCES photos(id) ON DELETE SET NULL,
+  FOREIGN KEY (asset_id) REFERENCES photo_assets(id) ON DELETE SET NULL,
   FOREIGN KEY (uploader_user_id) REFERENCES app_users(id) ON DELETE SET NULL
 );
 
@@ -188,6 +247,8 @@ CREATE INDEX IF NOT EXISTS idx_photo_upload_records_status_time
   ON photo_upload_records(queue_status, uploaded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_photo_upload_records_content
   ON photo_upload_records(content_id, class_id);
+CREATE INDEX IF NOT EXISTS idx_photo_upload_records_asset
+  ON photo_upload_records(asset_id, uploaded_at, id);
 
 CREATE TABLE IF NOT EXISTS saved_classes (
   user_id TEXT NOT NULL,

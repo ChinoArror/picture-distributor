@@ -63,6 +63,8 @@ export const Client = {
 
   searchClasses: (value) => request(`/api/class-search?q=${query(value)}`),
   history: () => request("/api/history"),
+  recentSearches: () => request("/api/class-search-history"),
+  saveSearchHistory: (entry) => request("/api/class-search-history", { method: "POST", json: entry }),
   deleteHistory: (type, historyId) =>
     request(`/api/history/${id(type)}/${id(historyId)}`, { method: "DELETE" }),
 
@@ -87,7 +89,7 @@ export const Client = {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.open("POST", `/api/classes/${id(classId)}/photos`);
-      xhr.timeout = 120_000;
+      xhr.timeout = 15 * 60_000;
       xhr.upload.addEventListener("progress", (event) => {
         if (event.lengthComputable) onProgress(Math.round((event.loaded / event.total) * 100));
       });
@@ -106,7 +108,7 @@ export const Client = {
         }
       });
       xhr.addEventListener("error", () => reject(new ApiError("Unable to reach the server.", 0)));
-      xhr.addEventListener("timeout", () => reject(new ApiError("Upload timed out.", 408)));
+      xhr.addEventListener("timeout", () => reject(new ApiError("上传等待时间过长，请检查网络后重试。", 408)));
       xhr.send(body);
     });
   },
@@ -176,4 +178,8 @@ export function photoUrl(photo) {
 
 export function photoThumbnailUrl(photo) {
   return photo?.thumbnailUrl || photo?.thumbnail_url || `/api/photos/${id(photo?.id)}/thumbnail`;
+}
+
+export function photoPreviewUrl(photo) {
+  return photo?.previewUrl || photo?.preview_url || `/api/photos/${id(photo?.id)}/preview`;
 }

@@ -40,10 +40,10 @@ Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebo
 | `/account` | 身份、Auth Center 绑定、主题、个人背景和 Bing 每日背景 |
 | `/admin` | 管理概览 |
 | `/admin/classes` | 所有类、上传者、张数、大小、公开状态、图片展开和强制删除 |
-| `/admin/uploads` | 按用户查看上传用量、按天筛选、处理状态、文件大小和 Images 处理开关 |
+| `/admin/uploads` | 按用户查看上传用量、按天筛选、处理状态、文件大小和 Images 处理开关；每个用户卡片的四项数据与查看按钮保持同一横排 |
 | `/admin/users` | 用户、稳定身份、角色对应、实际权限和空间用量 |
 | `/admin/roles` | 角色增删改、默认角色、权限模式和空间上限 |
-| `/admin/audit` | 按用户归组的行动记录、对象、UUID、IP、国家码和敏感标记 |
+| `/admin/audit` | 按用户归组的行动记录、对象、UUID、可选 IP、国家码、敏感标记和原页照片预览 |
 
 访问 `/` 会跳转到 `/home`。静态资源启用了 SPA 回退，直接打开任一前端路由
 也能正常加载。
@@ -57,7 +57,8 @@ Cloudflare 原生应用。项目包含 Google 风格类搜索、阿里云 Facebo
 - 搜索记录展开后，点击搜索栏和记录框以外区域会关闭记录框。
 - 提交搜索时，Aryuki 标识和搜索栏平滑移动到紧凑结果顶栏；向下浏览结果时
   只保留顶栏。
-- 搜索、存储、历史和识别结果网格读取缩略图；大图窗口和下载读取原图。
+- 搜索、存储、历史和识别结果网格读取缩略图。大图窗口也先显示缩略图；点击
+  「查看原图」时只把图片区域升级为预览图，下载时才读取原图。
 
 支持的搜索语法：
 
@@ -90,7 +91,8 @@ after:2026-01-01     创建时间不早于该日期
 ### 图片网格与悬浮窗口
 
 - 缩略图下方不显示文件名。
-- 点击缩略图后，以原图打开大图窗口。
+- 点击缩略图后在当前页面打开共用的全屏大图窗口，不发生页面跳转；窗口先显示
+  缩略图，按需加载预览图，原图仅用于下载。
 - 能读取到元数据时，大图窗口显示图片大小、尺寸、相机、拍摄时间、曝光时间、
   光圈、ISO 和焦距；无元数据时至少显示大小。
 - 一次下载或另存超过 5 张图片时需要二次确认，但不使用红色警告。
@@ -198,7 +200,8 @@ Aryuki Auth Center 是外部身份来源。Worker 验证回传 token 后，只�
 - `roles.quota_bytes` 是角色空间上限。
 - `app_users.storage_used_bytes` 是当前计费用量。
 - 上限为 `0` 表示不限量。
-- 只计算当前归该用户所有的原图字节。
+- 新 SHA-256 资产按实际保存的原图、预览图和缩略图总字节计入物理所有者；旧记录
+  在专门迁移前继续沿用旧计费方式。
 - 另存指针、分享引用、自拍输入和 Bing 背景不会作为重复原图计费。
 - 上传前在 D1 原子预留空间；超过当前角色上限时，不会继续提交存储。
 - 为避免别人另存的内容消失，上传者转移允许接管者暂时超过上限；在释放空间
@@ -215,9 +218,10 @@ Aryuki Auth Center 是外部身份来源。Worker 验证回传 token 后，只�
   会同步更新两个字段。
 - 修改类公开状态时只更新 SPA 局部状态，不刷新整个页面。
 
-单次请求最多上传 100 张图片，每张最大 25 MiB。Worker 根据文件字节签名验证，
-不信任文件名或浏览器声明的类型。支持 JPEG、PNG、WebP、GIF、AVIF、HEIC、
-HEIF；拒绝可执行的 SVG。
+单次请求最多上传 100 张图片。普通图片每张最大 25 MiB，Apple ProRAW DNG 每张
+最大 90 MiB。Worker 根据文件字节签名验证，不信任文件名或浏览器声明的类型。
+支持 JPEG、PNG、WebP、GIF、AVIF、HEIC、HEIF 和 Apple ProRAW DNG；拒绝可执行
+的 SVG。DNG 必须包含 Apple 相机写入、可直接显示的 JPEG 预览图。
 
 `photos.original_name` 和上传记录使用浏览器提供的 `File.name`。通常它就是设备
 相册选择器暴露的存储文件名；若浏览器出于隐私原因替换或临时生成了名称，网页
@@ -243,8 +247,8 @@ p_e2P5CHFMf7pPM2y_
 `bg_`、`save_`、`link_`、`role_`、`job_`、`audit_`、`up_`、`ses_`。
 `c_past000000000000` 是唯一一个旧数据迁移固定 ID 例外。
 
-每张新图片还有固定的内容 ID：对原图完整字节计算 MD5，使用 32 位小写十六进制
-结果。三个文件名共用同一个内容 ID：
+应用 migration `0008` 后接受的每次上传都使用固定内容 ID：对未经修改的原图完整
+字节计算 SHA-256，得到 64 位小写十六进制结果。三个文件名共用同一个内容 ID：
 
 ```text
 p_or_<内容-id>.<规范扩展名>
@@ -263,39 +267,66 @@ backgrounds/<用户-id>/<背景-id>-original.<扩展名>
 backgrounds/<用户-id>/<背景-id>-cropped.<扩展名>
 ```
 
-必须以 `photos.r2_key` 和 `photo_upload_records` 为准。旧对象保留原路径，
-不会因这次修改而重命名或移动，也不能根据 ID 猜测。MD5 只作为存储内容 ID，
-不用于密码、会话或权限安全。
+新图片的物理对象 key 以 `photo_assets` 为准；历史图片继续以 `photos.r2_key`
+为准。旧对象保留原路径和文件名，migration `0008` 不会重命名或移动它们。
+SHA-256 只用于内容身份和去重，不能替代任何权限判断。
+
+某个 SHA-256 内容第一次上传时，仍按原有目录规则把三个对象放在第一个类 ID
+下面。之后向其他类上传字节完全相同的图片时，会在目标类创建新的逻辑 `photos`
+记录，但复用同一条 `photo_assets`。所以图片仍分别显示在 My Classes 和
+All/Managed Classes 中，R2 实体却继续留在第一个类的文件夹。所有图片读取都先
+对逻辑图片、类和分享进行鉴权，之后才解析实体 key。
 
 ## 三层图片处理与加载
 
 以下是本仓库目前已经实现的行为：
 
-1. 上传请求先验证图片并保存原图。
+1. 上传请求先验证图片，对完整原始字节计算 SHA-256，并原子声明或复用
+   `photo_assets`。
 2. 不论 Images 处理是否开启，都写入一条 `photo_upload_records`，记录上传者
    快照、原文件名、上传后文件名、三个 key、原图/整体大小、时间和状态。
-   即使关闭 Images 处理，原图仍统一命名为 `p_or_<md5>.<扩展名>`。
+   即使关闭 Images 处理，原图仍统一命名为 `p_or_<sha256>.<扩展名>`。
 3. 开启 Images 处理后，发送 `photo.variants` 到 `INGEST_QUEUE`。消费者生成
    宽 1600、质量 84 的 WebP 预览图，以及宽 520、质量 74 的 WebP 缩略图。
-4. 状态只有 `queued`、`processing`、`completed`、`decline`、`error`。
+   ProRAW 原始 DNG 保持不变，衍生图与人脸录入使用其中内嵌的 JPEG 预览。
+4. Images 状态为 `queued`、`processing`、`completed`、`decline`、`error`。
    关闭处理时新上传写 `decline`；转换异常写 `error`。
+   人脸识别另有独立状态和错误详情；后台明确显示 `Images error` 或
+   `Facial recognition error`。
 5. `/api/photos/:id/thumbnail` 和 `/api/photos/:id/preview` 必须先判断本次
    请求权限，之后才查内部 Edge Cache；对浏览器始终返回 `private, no-store`。
 6. Edge Cache 只保存衍生图字节，不保存用户或会话的权限结论。即使已命中缓存，
    权限或公开状态发生变化后也不能绕过新的鉴权。
-7. 衍生图不存在时回退到已鉴权的原图。`/api/photos/:id/file` 始终输出原图，
-   并支持字节范围。
+7. 衍生图不存在时，ProRAW 回退到其内嵌 JPEG，其他格式回退到已鉴权的原图。
+   `/api/photos/:id/file` 始终输出未经修改的原图，并支持字节范围。
 8. 公共分享缩略图也会重新检查链接有效期、密码会话、分享所有者和已选内容，
    然后才走同一条私有衍生图读取路径。
-9. 物理删除会同时删除原图、预览图和缩略图。只发生指针接管时保留三个文件，
+9. 重复上传记录显示 `deduplicated`，`occupied_bytes=0`，并简要注明未增加存储；
+   审计仍保留该图片的原图大小和整体大小。
+10. 物理删除会同时删除原图、预览图和缩略图。只发生接管时保留三个文件，
    因为底层图片仍有效。
 
 已有图片只补写一条 `decline` 上传记录，不移动旧 R2 对象，也不声称完成过
 转换；读取时继续回退到已鉴权的原图。以后可以用有上限的 Queue 任务回填衍生图，
 但不能改变任何查看、增删、另存或分享权限。
 
-用户角色空间只计算原图。预览图和缩略图属于系统处理用量，记录在上传日志和
-管理员统计中，不会暗中计入上传者的个人空间。
+新 SHA-256 资产的原图和生成后的衍生图都计入物理所有者的角色空间和
+`storage_used_bytes`；重复逻辑图片不增加用量。
+
+### 图片上传去重与「另存到自己」是两条链路
+
+两条链路必须分开理解和实现：
+
+- 上传去重会在目标类创建另一张逻辑图片，只复用底层实体；
+- 「另存到自己」只创建 `saved_classes` 或 `saved_photos` 个人库指针，不创建
+  新的上传图片；
+- 去重资产的接管顺序看上传记录，另存内容的保留顺序看另存指针，两个表不能
+  互相代替。
+
+物理源图片被普通删除、但仍有其他逻辑上传引用时，最早的有效上传记录成为新的
+物理所有者。其标签由 `deduplicated` 改为 `completed`，`occupied_bytes` 改为
+资产总大小，旧所有者释放用量；R2 key 保持不变。管理员强制删除是明确例外：
+它忽略两条链路，删除实体和所有逻辑引用。
 
 ## 「另存到自己」与删除规则
 
@@ -380,14 +411,16 @@ backgrounds/<用户-id>/<背景-id>-cropped.<扩展名>
 - 每个类的上传者、张数、大小、公开状态和可展开图片；
 - 用户和角色对应、实际空间上限与用量；
 - 角色新建、修改、删除、排序和默认角色；
-- 按上传者归组的图片上传用量，支持精确到天的范围筛选、整体统计、原图/衍生图
-  大小、文件名和 Queue 状态；
+- 按上传者归组的图片上传用量，支持精确到天的范围筛选、整体统计、原图/衍生图/
+  实际占用大小、文件名、Images 与人脸识别详细错误，以及 `deduplicated` 接管状态；
+  每个上传者卡片把总上传、已处理、已复用、实际占用和查看按钮放在同一响应式横排；
 - 仅管理员可操作的 Images 处理开关；关闭时新上传记为 `decline`，处理失败保留
   为 `error`；
 - 重新发送失败的人脸索引；
 - 可恢复的旧 R2 key 搬迁；
 - 强制删除类或图片；
-- 按用户归组的审计记录。
+- 按用户归组的审计记录；IP 默认隐藏，由管理员开关显示；仍然有效的照片对象
+  在 `/admin/audit` 原页面调用共用全屏大图窗口，不再跳转到文件地址。
 
 可审计请求成功后，记录通过 Queue 写入。每条包含本地用户 ID、Auth Center
 UUID、行动名、IP、二字国家码、敏感标记、对象类型/ID/名称/数量和时间。
@@ -402,8 +435,9 @@ UUID、行动名、IP、二字国家码、敏感标记、对象类型/ID/名称/
 | `app_users` | Auth Center 稳定身份、资料、角色、管理员标记和计费用量 |
 | `app_sessions` | 本应用不透明会话 |
 | `photo_classes` | 类名称、介绍、上传者、公开状态和删除状态 |
-| `photos` | R2 key、上传者、所属类、大小、元数据、人脸实体、索引和删除状态 |
-| `photo_upload_records` | 上传者快照、内容 ID、三个对象 key、大小、时间和 Images Queue 状态 |
+| `photo_assets` | SHA-256 实体身份、不变的对象 key、物理所有者、字节、衍生图和人脸处理状态 |
+| `photos` | 逻辑类归属、上传者、可选资产引用、显示元数据、索引和删除状态 |
+| `photo_upload_records` | 上传者快照、内容 ID、三个对象 key、整体/实际占用、去重标记、时间及 Images/人脸状态 |
 | `image_processing_settings` | 管理员控制的单例 Images 处理开关 |
 | `saved_classes` | 用户到类的另存指针 |
 | `saved_photos` | 用户到图片的另存指针 |
@@ -474,6 +508,7 @@ GET|PATCH|DELETE   /api/share-links/:id
 GET                /api/public/shares/:slug
 POST               /api/public/shares/:slug/unlock
 GET                /api/public/shares/:slug/photos/:photoId/file
+GET                /api/public/shares/:slug/photos/:photoId/preview
 GET                /api/public/shares/:slug/photos/:photoId/thumbnail
 ```
 
@@ -513,6 +548,7 @@ worker/
   index.js            请求、API、Queue、Cron、鉴权和存储逻辑
   lib/
     alibaba.js        Facebody 接入
+    dng.js            ProRAW/DNG 检测与内嵌 JPEG 提取
     ids.js            96-bit 带类型 ID
     image-metadata.js 安全的文件头和 EXIF 提取
     passwords.js      分享密码哈希与加密
@@ -523,8 +559,8 @@ design-research/      参考图与视觉检查截图
 wrangler.toml         Worker 域名、绑定、Queue 和 Cron
 ```
 
-`.gitignore` 已排除本地输出、测试目录、构建/部署缓存、环境文件、凭据和各种
-secret 文件。
+`.gitignore` 已排除本地输出、测试目录、Playwright 报告/结果、临时目录、
+构建/部署缓存、环境文件、凭据，以及各种 secret 文件和目录。
 
 ## Cloudflare 绑定与配置
 
@@ -625,6 +661,9 @@ npx wrangler d1 migrations apply picture-distributor-db --remote
 | `0004_background_share_audit.sql` | 增加背景模式、分享密码加密显示材料和审计表 |
 | `0005_photo_metadata_audit_targets_email.sql` | 增加邮箱、图片元数据和审计对象字段 |
 | `0006_image_variants_upload_records.sql` | 增加 Images 开关和上传/衍生图用量记录；旧图片只补写 `decline`，不移动对象 |
+| `0007_anonymous_local_history.sql` | 未登录历史只保存在浏览器，并允许服务端搜索任务在清理后不再绑定用户 |
+| `0008_sha256_photo_assets.sql` | 增加 SHA-256 图片资产、逻辑图片引用、实际占用、去重及独立人脸状态；不修改旧名称和 R2 key |
+| `0009_photo_asset_concurrency.sql` | 防止并发的字节相同请求在同一个类中创建两张有效逻辑图片 |
 
 重要升级检查：全新 schema 支持 `own_read`。如果旧数据库最初通过 migration
 `0001` 创建，`roles.access_mode` 可能仍只有三个允许值，因为 migration `0003`
@@ -654,7 +693,7 @@ npm run check
 当前 `node:test` 覆盖：
 
 - 96-bit 带类型 ID；
-- 固定的 32 位小写 MD5 图片内容 ID；
+- 固定的 64 位小写 SHA-256 图片内容 ID 与资产引用；
 - 服务端和浏览器搜索语法；
 - 英文翻译与动态数量；
 - 图片元数据签名；

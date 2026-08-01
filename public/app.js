@@ -1,4 +1,4 @@
-import { ApiError, Client, photoThumbnailUrl, photoUrl } from "./client.js";
+import { ApiError, Client, photoPreviewUrl, photoThumbnailUrl, photoUrl } from "./client.js";
 import { dateLocale, getLocale, setLocale, translateText, watchLocale } from "./i18n.js";
 import { parseSearchQuery, SEARCH_HELP, syntaxChips } from "./search-syntax.js";
 
@@ -6,6 +6,7 @@ const app = document.querySelector("#app");
 const modalRoot = document.querySelector("#modal-root");
 const toastRoot = document.querySelector("#toast-root");
 const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)");
+if ("scrollRestoration" in history) history.scrollRestoration = "manual";
 
 function setPageTitle(title) {
   document.title = `${translateText(title)} · Aryuki Photo`;
@@ -21,6 +22,7 @@ const state = {
   selfieUrl: "",
   suggestions: [],
   suggestionIndex: -1,
+  recentSearches: [],
   shareLinks: [],
   shareClasses: [],
   shareLoosePhotos: [],
@@ -186,6 +188,9 @@ function AdminTable(columns, rows, emptyText = "暂无数据") {
 
 function normalizePhoto(photo, className = "") {
   const available = photo?.available !== false && photo?.deleted !== true;
+  const contentType = String(photo?.contentType || photo?.content_type || "").toLowerCase();
+  const originalUrl = available ? photoUrl(photo) : "";
+  const isDng = contentType === "image/x-adobe-dng" || contentType === "image/dng" || /\.dng(?:$|[?#])/i.test(photo?.name || photo?.original_name || "");
   let metadata = photo?.metadata || {};
   if (typeof metadata === "string") {
     try { metadata = JSON.parse(metadata); } catch { metadata = {}; }
@@ -195,7 +200,10 @@ function normalizePhoto(photo, className = "") {
     id: String(photo?.id || ""),
     classId: String(photo?.classId || photo?.class_id || ""),
     name: photo?.name || photo?.original_name || photo?.originalName || "照片",
-    url: available ? photoUrl(photo) : "",
+    contentType,
+    originalUrl,
+    previewUrl: available ? photoPreviewUrl(photo) : "",
+    url: available ? (isDng ? photoPreviewUrl(photo) : originalUrl) : "",
     thumbnailUrl: available ? photoThumbnailUrl(photo) : "",
     className: photo?.className || photo?.class_name || className,
     sizeBytes: Number(photo?.sizeBytes ?? photo?.size_bytes ?? photo?.byteSize ?? photo?.byte_size ?? 0),
@@ -219,6 +227,7 @@ function normalizeClass(item) {
     visibility: classVisibility(item),
     photoCount: Number(item?.photoCount ?? item?.photo_count ?? item?.photos?.length ?? 0),
     sizeBytes: Number(item?.sizeBytes ?? item?.size_bytes ?? item?.byteSize ?? item?.byte_size ?? item?.storageBytes ?? item?.storage_bytes ?? 0),
+    ownerUserId: String(item?.ownerUserId || item?.owner_user_id || ""),
     ownerName: item?.ownerName || item?.owner_name || item?.uploaderName || item?.uploader_name || "—",
   };
 }
@@ -246,6 +255,27 @@ function PhotoGrid(photos, options = {}) {
   const list = photos.map((photo) => normalizePhoto(photo, options.className));
   if (!list.length) return EmptyState("image", options.emptyText || "这里还没有照片");
   return `<div class="photo-grid">${list.map((photo) => PhotoCard(photo, options)).join("")}</div>`;
+}
+
+function groupPhotosByClass(photos, classes = []) {
+  const classNames = new Map(classes.map((item) => [String(item.id || item.classId || item.class_id || ""), item.name || item.className || item.class_name || ""]));
+  const groups = new Map();
+  photos.map((photo) => normalizePhoto(photo)).forEach((photo) => {
+    const name = photo.className || classNames.get(photo.classId) || "未分类";
+    const key = photo.classId || name;
+    if (!groups.has(key)) groups.set(key, { id: key, name, photos: [] });
+    groups.get(key).photos.push({ ...photo, className: name });
+  });
+  return [...groups.values()];
+}
+
+function PhotoResultGroups(groups) {
+  return groups.map((group) => `<section class="result-group">
+    <header class="result-group-head"><div><h2>${escapeHtml(group.name)}</h2><span class="result-meta">${group.photos.length} 张照片</span></div>
+      ${Button("全选", { size: "small", attrs: "data-select-photo-group aria-pressed=\"false\"" })}
+    </header>
+    ${PhotoGrid(group.photos, { className: group.name })}
+  </section>`).join("");
 }
 
 function SelectionToolbar() {
@@ -412,8 +442,8 @@ async function openBackgroundCrop(originalFile) {
     body: `<canvas class="background-crop-canvas" width="1600" height="900"></canvas>
       <div class="crop-controls">
         <label class="field"><span>缩放</span><input type="range" min="100" max="300" value="100" data-crop-zoom></label>
-        <label class="field"><span>水平位置</span><input type="range" min="-100" max="100" value="0" data-crop-x></label>
-        <label class="field"><span>垂直位置</span><input type="range" min="-100" max="100" value="0" data-crop-y></label>
+        <label class="field"><span>水平位置</span><input type="range" min="-100" max="100" value="0" data-crop-axis data-crop-x></label>
+        <label class="field"><span>垂直位置</span><input type="range" min="-100" max="100" value="0" data-crop-axis data-crop-y></label>
       </div>`,
     submitText: "保存裁切",
     onSubmit: async () => {
@@ -432,13 +462,24 @@ async function openBackgroundCrop(originalFile) {
   });
   const canvas = one(".background-crop-canvas", modalRoot);
   const context = canvas.getContext("2d");
+  const xInput = one("[data-crop-x]", modalRoot);
+  const yInput = one("[data-crop-y]", modalRoot);
+  const axisPosition = (input, overflow, frameSize) => {
+    const limit = Math.min(100, Math.max(0, overflow / frameSize * 100));
+    const value = Math.min(limit, Math.max(-limit, Number(input.value)));
+    input.value = String(value);
+    input.disabled = limit < .05;
+    input.style.setProperty("--range-start", `${50 - limit / 2}%`);
+    input.style.setProperty("--range-end", `${50 + limit / 2}%`);
+    return limit ? value / limit : 0;
+  };
   const draw = () => {
     const zoom = Number(one("[data-crop-zoom]", modalRoot).value) / 100;
-    const x = Number(one("[data-crop-x]", modalRoot).value) / 100;
-    const y = Number(one("[data-crop-y]", modalRoot).value) / 100;
     const scale = Math.max(canvas.width / image.naturalWidth, canvas.height / image.naturalHeight) * zoom;
     const width = image.naturalWidth * scale;
     const height = image.naturalHeight * scale;
+    const x = axisPosition(xInput, width - canvas.width, canvas.width);
+    const y = axisPosition(yInput, height - canvas.height, canvas.height);
     const left = -((width - canvas.width) / 2) * (1 + x);
     const top = -((height - canvas.height) / 2) * (1 + y);
     context.clearRect(0, 0, canvas.width, canvas.height);
@@ -478,6 +519,7 @@ async function renderSearch() {
       listOf(item, "photos").map((photo) => normalizePhoto(photo, item.name)));
     const chips = syntaxChips(parsed);
     const total = classes.reduce((sum, item) => sum + item.photoCount, 0);
+    rememberSearch(value, { resultCount: total });
     byId("search-results").className = "";
     byId("search-results").innerHTML = `<div class="search-summary">
       找到 <strong>${classes.length}</strong> 个公开类、<strong>${total}</strong> 张照片
@@ -485,7 +527,7 @@ async function renderSearch() {
     </div>
     ${classes.length ? classes.map((item) => {
       const photos = listOf(item, "photos").map((photo) => normalizePhoto(photo, item.name));
-      return `<section class="result-group"><header class="result-group-head"><div><h2>${escapeHtml(item.name)}</h2><span class="result-meta">${photos.length} 张照片</span></div>${Button("另存整个类", { iconName: "save", size: "small", attrs: `data-save-class="${escapeAttr(item.id)}" data-save-count="${photos.length}"` })}</header>${PhotoGrid(photos, { className: item.name })}</section>`;
+      return `<section class="result-group"><header class="result-group-head"><div><h2>${escapeHtml(item.name)}</h2><span class="result-meta">${photos.length} 张照片</span></div><div class="row-actions">${Button("全选", { size: "small", attrs: "data-select-photo-group aria-pressed=\"false\"" })}${Button("另存整个类", { iconName: "save", size: "small", attrs: `data-save-class="${escapeAttr(item.id)}" data-save-count="${photos.length}"` })}</div></header>${PhotoGrid(photos, { className: item.name })}</section>`;
     }).join("") : EmptyState("search", "没有匹配的公开类，试试更少的词或检查拼写。")}
     ${SelectionToolbar()}`;
     bindPhotoActions(state.activePhotos);
@@ -559,24 +601,127 @@ function bindSearchBox() {
   };
   document.addEventListener("pointerdown", closeOutside, true);
   state.pageCleanup.push(() => document.removeEventListener("pointerdown", closeOutside, true));
+
+  if (state.user && state.user.kind !== "temp") {
+    loadRecentSearches().then(() => {
+      if (form.isConnected && document.activeElement === input) refresh();
+    });
+  }
+}
+
+const LOCAL_SEARCH_COOKIE = "aryuki_photo_search_history";
+
+function readLocalSearchRecords() {
+  try {
+    const raw = document.cookie.split("; ").find((item) => item.startsWith(`${LOCAL_SEARCH_COOKIE}=`))?.split("=").slice(1).join("=");
+    const parsed = raw ? JSON.parse(decodeURIComponent(raw)) : [];
+    if (Array.isArray(parsed)) return parsed.filter((item) => item?.query).map((item) => ({
+      id: String(item.id || item.createdAt || item.query),
+      query: String(item.query).slice(0, 160),
+      createdAt: item.createdAt || new Date().toISOString(),
+      resultCount: Math.max(0, Number(item.resultCount || 0)),
+    }));
+  } catch {
+    // Ignore malformed or stale browser data.
+  }
+  try {
+    const legacy = JSON.parse(localStorage.getItem("aryuki-recent-searches") || "[]");
+    if (Array.isArray(legacy) && legacy.length) {
+      const now = Date.now();
+      const migrated = legacy.map((query, index) => ({
+        id: `local-${now - index}`,
+        query: String(query).slice(0, 160),
+        createdAt: new Date(now - index).toISOString(),
+        resultCount: 0,
+      }));
+      writeLocalSearchRecords(migrated);
+      localStorage.removeItem("aryuki-recent-searches");
+      return migrated;
+    }
+  } catch {
+    // Ignore malformed legacy data.
+  }
+  return [];
+}
+
+function writeLocalSearchRecords(records) {
+  const next = records.slice(0, 12);
+  while (next.length > 1 && encodeURIComponent(JSON.stringify(next)).length > 3500) next.pop();
+  const secure = location.protocol === "https:" ? "; Secure" : "";
+  document.cookie = `${LOCAL_SEARCH_COOKIE}=${encodeURIComponent(JSON.stringify(next))}; Path=/; Max-Age=31536000; SameSite=Lax${secure}`;
 }
 
 function readRecentSearches() {
-  try { return JSON.parse(localStorage.getItem("aryuki-recent-searches") || "[]"); }
-  catch { return []; }
+  const records = [
+    ...readLocalSearchRecords(),
+    ...state.recentSearches,
+  ].sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0));
+  const seen = new Set();
+  return records.map((item) => String(item.query || "").trim()).filter((query) => {
+    const key = query.toLocaleLowerCase();
+    if (!key || seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
 }
 
-function rememberSearch(value) {
-  const next = [value, ...readRecentSearches().filter((item) => item !== value)].slice(0, 12);
-  localStorage.setItem("aryuki-recent-searches", JSON.stringify(next));
+function rememberSearch(value, details = {}) {
+  const query = String(value || "").trim();
+  if (!query) return;
+  const createdAt = new Date().toISOString();
+  if (state.user && state.user.kind !== "temp") {
+    const key = query.toLocaleLowerCase();
+    state.recentSearches = [
+      { query, createdAt },
+      ...state.recentSearches.filter((item) => String(item.query || "").trim().toLocaleLowerCase() !== key),
+    ].slice(0, 12);
+    return;
+  }
+  const records = readLocalSearchRecords();
+  const key = query.toLocaleLowerCase();
+  const current = records.find((item) => item.query.toLocaleLowerCase() === key);
+  const record = {
+    id: current?.id || `local-${Date.now()}`,
+    query,
+    createdAt,
+    resultCount: Number(details.resultCount ?? current?.resultCount ?? 0),
+  };
+  writeLocalSearchRecords([record, ...records.filter((item) => item.query.toLocaleLowerCase() !== key)]);
 }
 
-function bindPhotoActions(photos, root = document) {
-  const localPhotos = photos.map(normalizePhoto);
-  state.activePhotos = localPhotos;
+async function loadRecentSearches() {
+  if (!state.user || state.user.kind === "temp") return;
+  try {
+    const data = await Client.recentSearches();
+    const items = listOf(data, "items");
+    state.recentSearches = items.length
+      ? items.map((item) => ({ query: String(item.query || ""), createdAt: item.lastUsed || item.last_used || item.createdAt || "" }))
+      : listOf(data, "queries").map((query) => ({ query: String(query), createdAt: "" }));
+  } catch {
+    // Search remains usable when history cannot be refreshed.
+  }
+}
+
+function forgetLocalSearch(id) {
+  writeLocalSearchRecords(readLocalSearchRecords().filter((item) => item.id !== id));
+}
+
+async function syncLocalSearchHistory() {
+  if (!state.user || state.user.kind === "temp") return;
+  const records = readLocalSearchRecords();
+  if (!records.length) return;
+  await Promise.all([...records].reverse().map((record) =>
+    Client.saveSearchHistory({ query: record.query, createdAt: record.createdAt })));
+  writeLocalSearchRecords([]);
+}
+
+function bindPhotoActions(photos, root = document, activePhotos = photos) {
+  const localPhotos = photos.map((photo) => normalizePhoto(photo));
+  const scopedPhotos = activePhotos.map((photo) => normalizePhoto(photo));
+  state.activePhotos = scopedPhotos;
   all("[data-photo-select]", root).forEach((button) => button.addEventListener("click", (event) => {
     event.stopPropagation();
-    state.activePhotos = localPhotos;
+    state.activePhotos = scopedPhotos;
     togglePhotoSelection(button.dataset.photoSelect);
   }));
   all("[data-photo-open]", root).forEach((card) => {
@@ -585,19 +730,46 @@ function bindPhotoActions(photos, root = document) {
   });
   all("[data-save-class]", root).forEach((button) => button.addEventListener("click", () =>
     saveClass(button.dataset.saveClass, Number(button.dataset.saveCount || 0))));
+  all("[data-select-photo-group]", root).forEach((button) => button.addEventListener("click", () => {
+    state.activePhotos = scopedPhotos;
+    const group = button.closest(".result-group") || root;
+    const ids = all("[data-photo-select]", group).map((item) => item.dataset.photoSelect).filter(Boolean);
+    const allSelected = ids.length > 0 && ids.every((id) => state.selected.has(id));
+    ids.forEach((id) => allSelected ? state.selected.delete(id) : state.selected.add(id));
+    syncPhotoSelectionState();
+  }));
+  updatePhotoGroupButtons();
   bindSelectionToolbar();
 }
 
 function togglePhotoSelection(photoId) {
   state.selected.has(photoId) ? state.selected.delete(photoId) : state.selected.add(photoId);
-  all(`[data-photo-open="${cssEscape(photoId)}"]`).forEach((card) => {
+  syncPhotoSelectionState();
+}
+
+function syncPhotoSelectionState() {
+  all("[data-photo-open]").forEach((card) => {
+    const photoId = card.dataset.photoOpen;
     const shell = card.closest(".photo-card");
     shell?.classList.toggle("selected", state.selected.has(photoId));
     const check = one("[data-photo-select]", shell);
     check?.classList.toggle("on", state.selected.has(photoId));
     check?.setAttribute("aria-label", `${state.selected.has(photoId) ? "取消选择" : "选择"}照片`);
   });
+  updatePhotoGroupButtons();
   updateSelectionToolbar();
+}
+
+function updatePhotoGroupButtons() {
+  all("[data-select-photo-group]").forEach((button) => {
+    const group = button.closest(".result-group");
+    const ids = group ? all("[data-photo-select]", group).map((item) => item.dataset.photoSelect).filter(Boolean) : [];
+    const allSelected = ids.length > 0 && ids.every((id) => state.selected.has(id));
+    button.classList.toggle("selected", allSelected);
+    button.setAttribute("aria-pressed", String(allSelected));
+    const label = one("span", button);
+    if (label) label.textContent = allSelected ? "取消全选" : "全选";
+  });
 }
 
 function updateSelectionToolbar() {
@@ -608,6 +780,8 @@ function updateSelectionToolbar() {
 }
 
 function bindSelectionToolbar() {
+  const toolbar = one(".selection-toolbar");
+  toolbar?.classList.toggle("with-mobile-nav", Boolean(one(".workspace .sidebar")));
   one("[data-save-selected]")?.addEventListener("click", saveSelected);
   one("[data-download-selected]")?.addEventListener("click", () => downloadSelected(false));
   one("[data-zip-selected]")?.addEventListener("click", () => downloadSelected(true));
@@ -661,7 +835,7 @@ function downloadSelected(zip = false) {
 }
 
 async function downloadPhoto(photo) {
-  const response = await fetch(photo.url, { credentials: "same-origin" });
+  const response = await fetch(photo.originalUrl || photo.url, { credentials: "same-origin" });
   if (!response.ok) throw new ApiError("无法下载这张照片。", response.status);
   const url = URL.createObjectURL(await response.blob());
   triggerDownload(url, photo.name || `${photo.id}.jpg`);
@@ -672,7 +846,7 @@ async function downloadZip(photos) {
   if (!window.JSZip) throw new ApiError("ZIP 组件尚未加载，请稍后重试。");
   const zip = new window.JSZip();
   for (const [index, photo] of photos.entries()) {
-    const response = await fetch(photo.url, { credentials: "same-origin" });
+    const response = await fetch(photo.originalUrl || photo.url, { credentials: "same-origin" });
     if (!response.ok) throw new ApiError(`第 ${index + 1} 张照片下载失败。`, response.status);
     zip.file(uniqueFilename(photo.name || `${photo.id}.jpg`, index), await response.blob());
   }
@@ -713,12 +887,16 @@ function PhotoMetadata(photo) {
     `<div><dt>${escapeHtml(label)}</dt><dd title="${escapeAttr(value)}">${escapeHtml(value)}</dd></div>`).join("")}</dl>`;
 }
 
-function ModalLightbox(photos, index) {
+function ModalLightbox(photos, index, previewLoaded = false) {
   const photo = photos[index];
+  const displayUrl = previewLoaded
+    ? (photo.previewUrl || photo.url || photo.thumbnailUrl)
+    : (photo.thumbnailUrl || photo.previewUrl || photo.url);
   return `<div class="modal-overlay" data-modal-overlay><section class="dialog lightbox" role="dialog" aria-modal="true" aria-label="照片预览" tabindex="-1">
     <div class="lightbox-body">
-      <section class="lightbox-media">
-        <img src="${escapeAttr(photo.url)}" alt="${escapeAttr(photo.name)}">
+      <section class="lightbox-media" data-lightbox-media>
+        <img src="${escapeAttr(displayUrl)}" alt="${escapeAttr(photo.name)}" draggable="false">
+        ${previewLoaded ? "" : `<button class="lightbox-preview-button" type="button" data-lightbox-preview>${icon("image")}<span>查看原图</span></button>`}
         <button class="icon-button lightbox-close" type="button" data-lightbox-close aria-label="关闭">${icon("close")}</button>
         ${photos.length > 1 ? `<button class="icon-button lightbox-arrow prev" type="button" data-lightbox-prev aria-label="上一张">${icon("left")}</button><button class="icon-button lightbox-arrow next" type="button" data-lightbox-next aria-label="下一张">${icon("right")}</button>` : ""}
       </section>
@@ -736,27 +914,149 @@ function ModalLightbox(photos, index) {
   </section></div>`;
 }
 
+function bindLightboxPanZoom(media) {
+  const image = one("img", media);
+  const pointers = new Map();
+  let scale = 1;
+  let x = 0;
+  let y = 0;
+  let gesture = null;
+
+  const apply = () => {
+    const bounds = media.getBoundingClientRect();
+    const maxX = bounds.width * (scale - 1) / 2;
+    const maxY = bounds.height * (scale - 1) / 2;
+    x = Math.min(maxX, Math.max(-maxX, x));
+    y = Math.min(maxY, Math.max(-maxY, y));
+    image.style.transform = `translate3d(${x}px,${y}px,0) scale(${scale})`;
+    media.classList.toggle("zoomed", scale > 1);
+  };
+
+  const startPan = ({ clientX, clientY }) => {
+    gesture = { type: "pan", clientX, clientY, x, y };
+  };
+
+  const startPinch = () => {
+    const [first, second] = [...pointers.values()];
+    const bounds = media.getBoundingClientRect();
+    const centerX = (first.clientX + second.clientX) / 2 - bounds.left - bounds.width / 2;
+    const centerY = (first.clientY + second.clientY) / 2 - bounds.top - bounds.height / 2;
+    gesture = {
+      type: "pinch",
+      distance: Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY),
+      scale,
+      imageX: (centerX - x) / scale,
+      imageY: (centerY - y) / scale,
+    };
+  };
+
+  media.addEventListener("pointerdown", (event) => {
+    if (event.target.closest("button")) return;
+    event.preventDefault();
+    media.setPointerCapture(event.pointerId);
+    pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (pointers.size === 1) startPan(event);
+    else if (pointers.size === 2) startPinch();
+  });
+
+  media.addEventListener("pointermove", (event) => {
+    if (!pointers.has(event.pointerId)) return;
+    event.preventDefault();
+    pointers.set(event.pointerId, { clientX: event.clientX, clientY: event.clientY });
+    if (pointers.size === 2 && gesture?.type === "pinch") {
+      const [first, second] = [...pointers.values()];
+      const bounds = media.getBoundingClientRect();
+      const centerX = (first.clientX + second.clientX) / 2 - bounds.left - bounds.width / 2;
+      const centerY = (first.clientY + second.clientY) / 2 - bounds.top - bounds.height / 2;
+      const distance = Math.hypot(first.clientX - second.clientX, first.clientY - second.clientY);
+      scale = Math.min(5, Math.max(1, gesture.scale * distance / Math.max(1, gesture.distance)));
+      x = centerX - scale * gesture.imageX;
+      y = centerY - scale * gesture.imageY;
+      apply();
+    } else if (pointers.size === 1 && gesture?.type === "pan" && scale > 1) {
+      x = gesture.x + event.clientX - gesture.clientX;
+      y = gesture.y + event.clientY - gesture.clientY;
+      apply();
+    }
+  });
+
+  const release = (event) => {
+    pointers.delete(event.pointerId);
+    if (pointers.size === 1) startPan([...pointers.values()][0]);
+    else if (!pointers.size) gesture = null;
+    if (scale === 1) { x = 0; y = 0; apply(); }
+  };
+  media.addEventListener("pointerup", release);
+  media.addEventListener("pointercancel", release);
+  media.addEventListener("dblclick", (event) => {
+    if (event.target.closest("button")) return;
+    event.preventDefault();
+    if (scale > 1) {
+      scale = 1;
+      x = 0;
+      y = 0;
+    } else {
+      const bounds = media.getBoundingClientRect();
+      scale = 2.5;
+      x = -(event.clientX - bounds.left - bounds.width / 2) * (scale - 1);
+      y = -(event.clientY - bounds.top - bounds.height / 2) * (scale - 1);
+    }
+    apply();
+  });
+}
+
+function loadLightboxPreview(dialog, photo, onLoaded) {
+  const media = one("[data-lightbox-media]", dialog);
+  const image = one("img", media);
+  const button = one("[data-lightbox-preview]", media);
+  const source = photo.previewUrl || photo.url || photo.thumbnailUrl;
+  if (!media || !image || !button || !source) return;
+  button.disabled = true;
+  media.classList.add("loading-preview");
+  const loader = new Image();
+  loader.onload = () => {
+    if (!dialog.isConnected) return;
+    image.src = source;
+    media.classList.remove("loading-preview");
+    button.remove();
+    onLoaded?.();
+  };
+  loader.onerror = () => {
+    if (!dialog.isConnected) return;
+    media.classList.remove("loading-preview");
+    button.disabled = false;
+    toast("预览图加载失败，请重试。", true);
+  };
+  loader.src = source;
+}
+
 function openLightbox(photoId, photos = state.activePhotos) {
-  const available = photos.filter((photo) => normalizePhoto(photo).available).map(normalizePhoto);
+  const available = photos.filter((photo) => normalizePhoto(photo).available).map((photo) => normalizePhoto(photo));
   if (!available.length) return;
   let index = Math.max(0, available.findIndex((photo) => photo.id === photoId));
+  let previewLoaded = false;
   state.dialogFocus = document.activeElement;
   lockPageScroll();
 
   const render = () => {
-    modalRoot.innerHTML = ModalLightbox(available, index);
+    modalRoot.innerHTML = ModalLightbox(available, index, previewLoaded);
     const dialog = one(".lightbox", modalRoot);
     dialog.focus();
+    bindLightboxPanZoom(one("[data-lightbox-media]", dialog));
     one("[data-lightbox-close]", dialog).addEventListener("click", closeDialog);
+    one("[data-lightbox-preview]", dialog)?.addEventListener("click", () =>
+      loadLightboxPreview(dialog, available[index], () => { previewLoaded = true; }));
     one("[data-modal-overlay]", modalRoot).addEventListener("click", (event) => {
       if (event.target === event.currentTarget) closeDialog();
     });
     one("[data-lightbox-prev]", dialog)?.addEventListener("click", () => {
       index = (index - 1 + available.length) % available.length;
+      previewLoaded = false;
       render();
     });
     one("[data-lightbox-next]", dialog)?.addEventListener("click", () => {
       index = (index + 1) % available.length;
+      previewLoaded = false;
       render();
     });
     one("[data-lightbox-download]", dialog).addEventListener("click", () =>
@@ -774,8 +1074,8 @@ function openLightbox(photoId, photos = state.activePhotos) {
       }
     });
     dialog.addEventListener("keydown", (event) => {
-      if (event.key === "ArrowLeft") { event.preventDefault(); index = (index - 1 + available.length) % available.length; render(); }
-      if (event.key === "ArrowRight") { event.preventDefault(); index = (index + 1) % available.length; render(); }
+      if (event.key === "ArrowLeft") { event.preventDefault(); index = (index - 1 + available.length) % available.length; previewLoaded = false; render(); }
+      if (event.key === "ArrowRight") { event.preventDefault(); index = (index + 1) % available.length; previewLoaded = false; render(); }
       if (event.key === "Escape") closeDialog();
     });
   };
@@ -891,10 +1191,10 @@ async function startFaceSearch() {
       const status = await Client.searchStatus(taskId);
       if (status.status === "failed") throw new ApiError(status.error || "人脸识别失败。");
       if (status.status !== "completed") continue;
-      const photos = listOf(status, "results", "photos").map(normalizePhoto);
+      const photos = listOf(status, "results", "photos").map((photo) => normalizePhoto(photo));
       state.selected.clear();
       state.activePhotos = photos;
-      results.innerHTML = `<div class="result-group-head"><div><h2>找到 ${photos.length} 张照片</h2><span class="result-meta">可预览、另存或批量下载</span></div></div>${PhotoGrid(photos)}${SelectionToolbar()}`;
+      results.innerHTML = `<div class="result-group-head"><div><h2>找到 ${photos.length} 张照片</h2><span class="result-meta">可预览、另存或批量下载</span></div></div>${PhotoResultGroups(groupPhotosByClass(photos))}${SelectionToolbar()}`;
       bindPhotoActions(photos);
       return;
     }
@@ -923,9 +1223,22 @@ async function renderHistory() {
     <div id="history-list" class="loading-state">正在载入历史记录…</div>`, "/history");
   const version = state.routeVersion;
   try {
-    const data = await Client.history();
+    const data = state.user ? await Client.history() : { records: [] };
     if (version !== state.routeVersion) return;
-    const items = normalizeHistory(data);
+    const localItems = readLocalSearchRecords().map((item) => ({
+      id: item.id,
+      key: `search:${item.id}`,
+      type: "search",
+      title: `搜索：${item.query}`,
+      query: item.query,
+      createdAt: item.createdAt,
+      photos: [],
+      count: item.resultCount,
+      local: true,
+    }));
+    const items = mergeHistoryItems([...normalizeHistory(data), ...localItems]);
+    const historyPhotos = [...new Map(items.flatMap((item) => item.photos).map((photo) => [photo.id, photo])).values()];
+    state.activePhotos = historyPhotos;
     byId("history-list").className = "history-list";
     byId("history-list").innerHTML = items.length ? items.map((item) => `<article class="card history-item">
       <div class="history-summary">
@@ -947,13 +1260,14 @@ async function renderHistory() {
       panel.hidden = !panel.hidden;
       button.querySelector("span").textContent = panel.hidden ? "查看" : "收起";
       if (panel.hidden || panel.childElementCount) return;
-      panel.innerHTML = PhotoGrid(item.photos, { selectable: false, emptyText: "暂无可见照片" });
-      bindPhotoActions(item.photos, panel);
+      panel.innerHTML = PhotoGrid(item.photos, { emptyText: "暂无可见照片" });
+      bindPhotoActions(item.photos, panel, historyPhotos);
     }));
     all("[data-history-delete]").forEach((button) => button.addEventListener("click", () => {
       const item = items.find((entry) => entry.key === button.dataset.historyDelete);
       if (item) confirmAction("删除这条历史记录？", "只会删除记录，不会删除照片。", async () => {
-        await Client.deleteHistory(item.type, item.id);
+        if (item.local) forgetLocalSearch(item.id);
+        else await Client.deleteHistory(item.type, item.id);
         await renderHistory();
       }, true);
     }));
@@ -973,7 +1287,7 @@ function normalizeHistory(data) {
       type: "selfie",
       title: item.title || item.selfie?.name || "自拍识别",
       createdAt: item.createdAt || item.created_at,
-      photos: listOf(item, "photos", "results").map(normalizePhoto),
+      photos: listOf(item, "photos", "results").map((photo) => normalizePhoto(photo)),
       count: Number(item.matchCount ?? item.match_count ?? item.resultCount ?? item.results?.length ?? 0),
     })),
     ...searches.map((item) => ({
@@ -982,11 +1296,24 @@ function normalizeHistory(data) {
       title: item.title || `搜索：${item.query || ""}`,
       query: item.query || "",
       createdAt: item.createdAt || item.created_at || item.lastUsed || item.last_used,
-      photos: listOf(item, "photos", "results").map(normalizePhoto),
+      photos: listOf(item, "photos", "results").map((photo) => normalizePhoto(photo)),
       count: Number(item.resultCount ?? item.result_count ?? item.photos?.length ?? 0),
     })),
   ].map((item) => ({ ...item, key: `${item.type}:${item.id}` }))
     .sort((a, b) => new Date(b.createdAt || 0) - new Date(a.createdAt || 0));
+}
+
+function mergeHistoryItems(items) {
+  const seenSearches = new Set();
+  return [...items]
+    .sort((left, right) => new Date(right.createdAt || 0) - new Date(left.createdAt || 0))
+    .filter((item) => {
+      if (item.type !== "search") return true;
+      const key = String(item.query || item.title || "").trim().toLocaleLowerCase();
+      if (!key || seenSearches.has(key)) return false;
+      seenSearches.add(key);
+      return true;
+    });
 }
 
 async function renderSave() {
@@ -1012,12 +1339,12 @@ async function renderSave() {
     if (version !== state.routeVersion) return;
     const owned = listOf(ownedData, "classes").map(normalizeClass);
     const savedClasses = listOf(savedData, "classes", "savedClasses").map(normalizeClass);
-    const savedPhotos = listOf(savedData, "photos", "savedPhotos").map(normalizePhoto);
+    const savedPhotos = listOf(savedData, "photos", "savedPhotos").map((photo) => normalizePhoto(photo));
     const storage = storageData.storage || {
       usedBytes: state.user?.storageUsedBytes ?? state.user?.storage_used_bytes ?? 0,
       quotaBytes: state.user?.quotaBytes ?? state.user?.quota_bytes ?? 0,
     };
-    state.savePage = { owned, savedClasses, savedPhotos, writable, ownRead, allClasses, sort: "saved", storage };
+    state.savePage = { owned, savedClasses, savedPhotos, writable, ownRead, allClasses, classFilter: "all", sort: "saved", storage };
     byId("save-content").className = "";
     byId("save-content").innerHTML = `${ownRead ? "" : Card(`<div class="stats">
       <div class="stat"><div class="stat-label">已用空间</div><div class="stat-value" data-storage-used-value>${formatBytes(storage.usedBytes ?? storage.used_bytes)}</div></div>
@@ -1053,7 +1380,7 @@ function OwnedClassCard(item, writable = true) {
       <div class="row-actions">
       ${Button("查看照片", { iconName: "image", size: "small", attrs: `data-manage-owned="${escapeAttr(item.id)}"` })}
       ${writable ? `
-      <label class="button small">${icon("upload")}上传<input type="file" accept="image/*" multiple hidden data-upload-class="${escapeAttr(item.id)}"></label>
+      <label class="button small">${icon("upload")}上传<input type="file" accept="image/*,.dng,image/dng,image/x-adobe-dng" multiple hidden data-upload-class="${escapeAttr(item.id)}"></label>
       ${Button("删除", { tone: "danger", size: "small", attrs: `data-delete-owned="${escapeAttr(item.id)}"` })}` : ""}
     </div></div><div class="owned-photo-panel" data-owned-photo-panel="${escapeAttr(item.id)}" hidden></div>`, "class-card storage-class-row");
 }
@@ -1065,8 +1392,21 @@ function renderOwnedSection() {
   const title = userAccessMode() === "all_write"
     ? "可管理的类"
     : userAccessMode() === "all_read" ? "所有类（只读）" : "我上传的类";
-  section.innerHTML = `<header class="save-section-head"><h2>${title}</h2><span class="result-meta">${page.owned.length} 个</span></header>
-    ${page.owned.length ? `<div class="class-list storage-class-list">${page.owned.map((item) => OwnedClassCard(item, page.writable)).join("")}</div>` : EmptyState("class", page.writable ? "你还没有创建类" : "当前角色没有类写入权限")}`;
+  const currentUserId = String(state.user?.id || "");
+  const visible = page.owned.filter((item) => page.classFilter === "mine"
+    ? item.ownerUserId === currentUserId
+    : page.classFilter === "other" ? item.ownerUserId !== currentUserId : true);
+  const filter = page.allClasses ? `<label class="sort-field managed-class-filter"><span>筛选</span><select class="select compact" data-class-filter>
+      <option value="all" ${page.classFilter === "all" ? "selected" : ""}>全部</option>
+      <option value="mine" ${page.classFilter === "mine" ? "selected" : ""}>我的类</option>
+      <option value="other" ${page.classFilter === "other" ? "selected" : ""}>其他类</option>
+    </select></label>` : "";
+  section.innerHTML = `<header class="save-section-head"><h2>${title}</h2><div class="page-actions managed-class-actions"><span class="result-meta">${visible.length} 个</span>${filter}</div></header>
+    ${visible.length ? `<div class="class-list storage-class-list">${visible.map((item) => OwnedClassCard(item, page.writable)).join("")}</div>` : EmptyState("class", page.allClasses ? "没有符合筛选条件的类" : (page.writable ? "你还没有创建类" : "当前角色没有类写入权限"))}`;
+  one("[data-class-filter]", section)?.addEventListener("change", (event) => {
+    page.classFilter = event.currentTarget.value;
+    renderOwnedSection();
+  });
   bindOwnedClasses();
 }
 
@@ -1364,7 +1704,7 @@ async function renderShareLinks() {
     state.shareLinks = listOf(linksData, "links", "shareLinks").map(normalizeShare);
     state.shareClasses = listOf(linksData, "classes").map(normalizeClass);
     state.shareLoosePhotos = listOf(linksData, "photos", "savedPhotos")
-      .map(normalizePhoto)
+      .map((photo) => normalizePhoto(photo))
       .filter((photo) => photo.savedKind !== "class");
     let selected = state.shareLinks.find((item) => item.id === requestedId) || null;
     if (selected) {
@@ -1390,7 +1730,7 @@ function renderShareEditor(share) {
   return Card(`<form id="share-form">
     <div class="form-grid">
       <label class="field"><span>自定义后缀</span><input class="input" name="slug" value="${escapeAttr(slug)}" pattern="[A-Za-z0-9_\\-]{3,64}" minlength="3" maxlength="64" placeholder="graduation-2026" required></label>
-      <div class="field share-password-field"><label class="check-label"><input class="switch-input" name="passwordEnabled" type="checkbox" data-password-enabled ${share?.passwordRequired ? "checked" : ""}><span class="switch ${share?.passwordRequired ? "on" : ""}" aria-hidden="true"></span><span>需要密码</span></label>
+      <div class="field share-password-field"><label class="check-label share-password-toggle"><input class="switch-input" name="passwordEnabled" type="checkbox" data-password-enabled ${share?.passwordRequired ? "checked" : ""}><span class="switch ${share?.passwordRequired ? "on" : ""}" aria-hidden="true"></span><span>需要密码</span></label>
         ${share?.passwordRequired ? `<div class="share-password-owner" data-password-owner>
           <button type="button" data-edit-password title="点击修改密码"><code>${escapeHtml(share.password || "点击设置新密码")}</code></button>
           ${share.password ? `<button class="icon-button" type="button" data-copy-password aria-label="复制密码">${icon("copy")}</button>` : ""}
@@ -1416,16 +1756,18 @@ function renderSharePicker() {
   const classes = state.shareClasses.map((item) => {
     const photos = state.expandedShareClasses.get(item.id);
     const classChecked = state.shareSelection.classIds.has(item.id);
+    const allPhotosSelected = Boolean(photos?.length) && photos.every((photo) => state.shareSelection.photoIds.has(photo.id));
     return `<section class="share-class">
       <div class="share-class-head">
         <label class="check-label share-check-label"><input class="choice-input" type="checkbox" data-share-class="${escapeAttr(item.id)}" ${classChecked ? "checked" : ""}><span class="photo-check ${classChecked ? "on" : ""}" aria-hidden="true"></span><span><strong>${escapeHtml(item.name)}</strong><br><small>${item.photoCount} 张 · ${item.visibility}</small></span></label>
-        ${Button(photos ? "收起照片" : "选择照片", { size: "small", attrs: `data-expand-share="${escapeAttr(item.id)}"` })}
+        <div class="row-actions">${Button(allPhotosSelected ? "取消全选" : "全选", { size: "small", attrs: `data-share-select-all="${escapeAttr(item.id)}" aria-pressed="${allPhotosSelected}"` })}${Button(photos ? "收起照片" : "选择照片", { size: "small", attrs: `data-expand-share="${escapeAttr(item.id)}"` })}</div>
       </div>
       ${photos ? `<div class="share-photo-list">${photos.length ? photos.map((photo) => `<label class="share-photo-choice"><input class="choice-input" type="checkbox" data-share-photo="${escapeAttr(photo.id)}" ${state.shareSelection.photoIds.has(photo.id) ? "checked" : ""} ${classChecked ? "disabled" : ""}><img src="${escapeAttr(photo.thumbnailUrl || photo.url)}" alt="" loading="lazy"><span class="photo-check ${state.shareSelection.photoIds.has(photo.id) ? "on" : ""}" aria-hidden="true"></span></label>`).join("") : "<span class='camera-note'>暂无照片</span>"}</div>` : ""}
     </section>`;
   }).join("");
+  const allLooseSelected = Boolean(state.shareLoosePhotos.length) && state.shareLoosePhotos.every((photo) => state.shareSelection.photoIds.has(photo.id));
   const loose = state.shareLoosePhotos.length ? `<section class="share-class">
-    <div class="share-class-head"><div><strong>独立照片</strong><br><small>原类删除后由你接管的原图</small></div></div>
+    <div class="share-class-head"><div><strong>独立照片</strong><br><small>原类删除后由你接管的原图</small></div>${Button(allLooseSelected ? "取消全选" : "全选", { size: "small", attrs: `data-share-select-all="__loose" aria-pressed="${allLooseSelected}"` })}</div>
     <div class="share-photo-list">${state.shareLoosePhotos.map((photo) => `<label class="share-photo-choice">
       <input class="choice-input" type="checkbox" data-share-photo="${escapeAttr(photo.id)}" ${state.shareSelection.photoIds.has(photo.id) ? "checked" : ""}>
       <img src="${escapeAttr(photo.thumbnailUrl || photo.url)}" alt="" loading="lazy">
@@ -1537,6 +1879,30 @@ function bindSharePicker() {
   }));
   all("[data-share-photo]").forEach((input) => input.addEventListener("change", () => {
     input.checked ? state.shareSelection.photoIds.add(input.dataset.sharePhoto) : state.shareSelection.photoIds.delete(input.dataset.sharePhoto);
+    one("#share-picker").innerHTML = renderSharePicker();
+    bindSharePicker();
+  }));
+  all("[data-share-select-all]").forEach((button) => button.addEventListener("click", async () => {
+    const classId = button.dataset.shareSelectAll;
+    let photos = classId === "__loose" ? state.shareLoosePhotos : state.expandedShareClasses.get(classId);
+    if (!photos) {
+      button.disabled = true;
+      try {
+        const data = await Client.classPhotos(classId);
+        const item = state.shareClasses.find((entry) => entry.id === classId);
+        photos = listOf(data, "photos").map((photo) => normalizePhoto(photo, item?.name));
+        state.expandedShareClasses.set(classId, photos);
+      } catch (error) {
+        toast(friendlyError(error), true);
+        return;
+      }
+    }
+    const ids = photos.map((photo) => photo.id);
+    const allSelected = ids.length > 0 && ids.every((id) => state.shareSelection.photoIds.has(id));
+    if (classId !== "__loose") state.shareSelection.classIds.delete(classId);
+    ids.forEach((id) => allSelected ? state.shareSelection.photoIds.delete(id) : state.shareSelection.photoIds.add(id));
+    one("#share-picker").innerHTML = renderSharePicker();
+    bindSharePicker();
   }));
   all("[data-expand-share]").forEach((button) => button.addEventListener("click", async () => {
     const classId = button.dataset.expandShare;
@@ -1561,7 +1927,7 @@ async function refreshShareContent(event) {
     const data = await Client.shareLinks(true);
     state.shareClasses = listOf(data, "classes").map(normalizeClass);
     state.shareLoosePhotos = listOf(data, "photos", "savedPhotos")
-      .map(normalizePhoto)
+      .map((photo) => normalizePhoto(photo))
       .filter((photo) => photo.savedKind !== "class");
     state.expandedShareClasses.clear();
     const picker = byId("share-picker");
@@ -1633,17 +1999,18 @@ function renderShareUnlock(slug) {
 function renderPublicShareData(slug, data) {
   const share = normalizeShare(data.share || data.link || data);
   const classes = listOf(data, "classes");
+  const classNames = new Map(classes.map((item) => [String(item.id || item.classId || item.class_id || ""), item.name || item.className || item.class_name || ""]));
   let photos = listOf(data, "photos");
   if (!photos.length) photos = classes.flatMap((item) => listOf(item, "photos").map((photo) => ({ ...photo, className: item.name })));
   photos = photos.map((photo) => {
-    const normalized = normalizePhoto(photo);
+    const normalized = normalizePhoto(photo, classNames.get(String(photo.classId || photo.class_id || "")) || "");
     if (!photo.url && normalized.available) normalized.url = `/api/public/shares/${encodeURIComponent(slug)}/photos/${encodeURIComponent(normalized.id)}/file`;
     return normalized;
   });
   state.selected.clear();
   state.activePhotos = photos;
   byId("public-share").className = "";
-  byId("public-share").innerHTML = `${Card(`<h1>${escapeHtml(share.title || `分享：/${slug}`)}</h1><p>${share.startAt ? formatDate(share.startAt) : "现在"} 至 ${share.endAt ? formatDate(share.endAt) : "长期有效"} · ${photos.length} 张可见照片</p>`, "public-share-head")}${PhotoGrid(photos)}${SelectionToolbar()}`;
+  byId("public-share").innerHTML = `${Card(`<h1>${escapeHtml(share.title || `分享：/${slug}`)}</h1><p>${share.startAt ? formatDate(share.startAt) : "现在"} 至 ${share.endAt ? formatDate(share.endAt) : "长期有效"} · ${photos.length} 张可见照片</p>`, "public-share-head")}${PhotoResultGroups(groupPhotosByClass(photos, classes))}${SelectionToolbar()}`;
   bindPhotoActions(photos);
 }
 
@@ -1766,8 +2133,10 @@ function renderAdminUploadData(root, data, apiRange) {
   const stats = [
     ["总上传数", Number(summary.totalUploads || 0)],
     ["处理数", Number(summary.processedCount || 0)],
+    ["已复用", Number(summary.deduplicatedCount || 0)],
     ["原图大小", formatBytes(summary.originalBytes || 0)],
     ["整体占用", formatBytes(summary.totalBytes || 0)],
+    ["实际占用", formatBytes(summary.occupiedBytes || 0)],
   ];
   root.className = "admin-upload-content";
   root.innerHTML = `<div class="upload-range-label"><span class="badge purple">${data.range?.all ? "全部时间" : "所选日期范围"}</span>
@@ -1781,7 +2150,8 @@ function renderAdminUploadData(root, data, apiRange) {
         <div class="upload-user-summary">
           <span><strong>${Number(group.totalUploads || 0)}</strong><small>总上传</small></span>
           <span><strong>${Number(group.processedCount || 0)}</strong><small>已处理</small></span>
-          <span><strong>${formatBytes(group.totalBytes || 0)}</strong><small>经手文件</small></span>
+          <span><strong>${Number(group.deduplicatedCount || 0)}</strong><small>已复用</small></span>
+          <span><strong>${formatBytes(group.occupiedBytes || 0)}</strong><small>实际占用</small></span>
           ${Button("查看", { size: "small", attrs: `data-upload-view="${escapeAttr(group.key)}"` })}
         </div>
       </header>
@@ -1834,10 +2204,15 @@ function uploadRecordMarkup(record) {
     queued: "queued",
     processing: "processing",
     completed: "completed",
+    deduplicated: "deduplicated",
     decline: "decline",
     error: "error",
   })[status] || status;
-  const badge = status === "completed" ? "green" : status === "error" ? "red" : status === "processing" ? "purple" : "";
+  const badge = ["completed", "deduplicated"].includes(status) ? "green" : status === "error" ? "red" : status === "processing" ? "purple" : "";
+  const errors = [
+    record.imageError ? `Images error: ${record.imageError}` : "",
+    record.facialError ? `Facial recognition error: ${record.facialError}` : "",
+  ].filter(Boolean);
   return `<div class="upload-record-row">
     <div class="upload-record-files">
       <span class="upload-file-name" title="${escapeAttr(record.originalFilename)}">${escapeHtml(record.originalFilename)}</span>
@@ -1845,14 +2220,15 @@ function uploadRecordMarkup(record) {
       ${record.className ? `<small>${escapeHtml(record.className)}</small>` : ""}
     </div>
     <div class="upload-record-actor"><span>${formatDate(record.uploadedAt)}</span><small>${escapeHtml(record.uploaderName || "未知用户")}</small></div>
-    <div class="upload-record-size"><span>${formatBytes(record.originalBytes || 0)} 原图</span><small>${formatBytes(record.totalBytes || 0)} 整体 · ${formatBytes(record.previewBytes || 0)} preview · ${formatBytes(record.thumbnailBytes || 0)} thumbnail</small></div>
-    <div class="upload-record-status"><span class="badge ${badge}">${statusLabel}</span>${record.error ? `<small title="${escapeAttr(record.error)}">${escapeHtml(record.error)}</small>` : ""}</div>
+    <div class="upload-record-size"><span>${formatBytes(record.originalBytes || 0)} 原图 · ${formatBytes(record.occupiedBytes || 0)} 占用</span><small>${formatBytes(record.totalBytes || 0)} 整体 · ${formatBytes(record.previewBytes || 0)} preview · ${formatBytes(record.thumbnailBytes || 0)} thumbnail</small>${record.deduplicated ? "<small>复用图片 · 未增加存储</small>" : ""}</div>
+    <div class="upload-record-status"><span class="badge ${badge}">${statusLabel}</span>${errors.map((error) => `<small title="${escapeAttr(error)}">${escapeHtml(error)}</small>`).join("")}</div>
   </div>`;
 }
 
 async function renderAdminAudit() {
   setPageTitle("审计");
-  app.innerHTML = Workspace(`${PageHead("审计", "按用户查看操作记录。")}
+  const ipToggle = `<div class="audit-ip-toggle"><button class="switch" type="button" role="switch" aria-checked="false" data-audit-ip-toggle></button><span>显示 IP 地址</span></div>`;
+  app.innerHTML = Workspace(`${PageHead("审计", "按用户查看操作记录。", ipToggle)}
     <div id="admin-audit" class="loading-state">正在载入操作记录…</div>`, "/admin/audit", { admin: true });
   const version = state.routeVersion;
   try {
@@ -1876,7 +2252,7 @@ async function renderAdminAudit() {
         ${group.logs.map((log) => `<div class="audit-row ${log.sensitive ? "sensitive" : ""}">
           <div class="audit-action"><strong>${escapeHtml(auditActionName(log.action))}</strong>${auditTargetMarkup(log)}</div>
           <span>${formatDate(log.createdAt)}</span>
-          <code>${escapeHtml(log.ipAddress || "—")}</code>
+          <div class="audit-detail-cell">${auditDetailMarkup(log)}<code class="audit-ip-address">${escapeHtml(log.ipAddress || "—")}</code></div>
           <span class="badge">${escapeHtml(log.countryCode || "--")}</span>
         </div>`).join("")}
       </div>
@@ -1892,6 +2268,24 @@ async function renderAdminAudit() {
       button.classList.add("copied");
       button.innerHTML = icon("check");
     }));
+    all("[data-audit-photo]").forEach((button) => button.addEventListener("click", () => {
+      const photoId = String(button.dataset.auditPhoto || "");
+      if (!photoId) return;
+      const photo = normalizePhoto({
+        id: photoId,
+        name: button.dataset.auditPhotoName || "照片",
+        className: button.dataset.auditPhotoClass || "",
+      });
+      state.activePhotos = [photo];
+      openLightbox(photoId, [photo]);
+    }));
+    one("[data-audit-ip-toggle]")?.addEventListener("click", (event) => {
+      const button = event.currentTarget;
+      const show = button.getAttribute("aria-checked") !== "true";
+      button.setAttribute("aria-checked", String(show));
+      button.classList.toggle("on", show);
+      root.classList.toggle("show-ip", show);
+    });
   } catch (error) {
     if (version === state.routeVersion) byId("admin-audit").outerHTML = ErrorState(error, "data-retry-admin-audit");
     one("[data-retry-admin-audit]")?.addEventListener("click", renderAdminAudit);
@@ -1899,12 +2293,58 @@ async function renderAdminAudit() {
 }
 
 function auditTargetMarkup(log) {
-  const name = String(log.targetName || "");
+  const rawName = String(log.targetName || "");
+  const name = log.action === "admin.user.update" ? rawName.split(" · ")[0] : rawName;
   if (!name) return "";
   const label = log.targetKind === "photos"
     ? `「${name}」类下的 ${Number(log.targetCount || 1)} 张照片`
     : name;
-  return `<span class="audit-target-line"><span class="audit-target" title="${escapeAttr(label)}">${escapeHtml(label)}</span><button class="icon-button" type="button" data-copy-audit-target="${escapeAttr(name)}" aria-label="复制对象名称">${icon("copy")}</button></span>`;
+  const photoId = auditPhotoPreviewId(log);
+  const href = auditTargetHref(log);
+  const target = photoId
+    ? `<button class="audit-target audit-photo-link" type="button" data-audit-photo="${escapeAttr(photoId)}" data-audit-photo-name="${escapeAttr(label)}" data-audit-photo-class="${escapeAttr(name)}" title="${escapeAttr(label)}">${escapeHtml(label)}</button>`
+    : href
+      ? `<a class="audit-target" href="${escapeAttr(href)}" data-nav title="${escapeAttr(label)}">${escapeHtml(label)}</a>`
+      : `<span class="audit-target" title="${escapeAttr(label)}">${escapeHtml(label)}</span>`;
+  return `<span class="audit-target-line">${target}<button class="icon-button" type="button" data-copy-audit-target="${escapeAttr(name)}" aria-label="复制对象名称">${icon("copy")}</button></span>`;
+}
+
+function auditPhotoPreviewId(log) {
+  const id = String(log.targetId || "");
+  const action = String(log.action || "");
+  if (!id || log.targetKind !== "photos") return "";
+  if (["photo.upload", "photo.upload.deduplicated"].includes(action) || action.includes("delete")) return "";
+  return id;
+}
+
+function auditTargetHref(log) {
+  const id = String(log.targetId || "");
+  if (!id) return "";
+  if (log.targetKind === "class") return `/admin/classes?id=${encodeURIComponent(id)}`;
+  if (log.targetKind === "photos" && ["photo.upload", "photo.upload.deduplicated"].includes(log.action)) return `/admin/classes?id=${encodeURIComponent(id)}`;
+  if (log.targetKind === "share") return `/share-link?id=${encodeURIComponent(id)}`;
+  if (log.targetKind === "user") return "/admin/users";
+  if (log.targetKind === "role") return "/admin/roles";
+  return "";
+}
+
+function auditDetailMarkup(log) {
+  const rawName = String(log.targetName || "");
+  if (log.action === "admin.user.update" && rawName.includes(" · ")) {
+    return `<span class="audit-detail" title="${escapeAttr(rawName.split(" · ").slice(1).join(" · "))}">角色变更：${escapeHtml(rawName.split(" · ").slice(1).join(" · "))}</span>`;
+  }
+  const photoId = auditPhotoPreviewId(log);
+  if (photoId) {
+    return `<button class="audit-detail audit-photo-link" type="button" data-audit-photo="${escapeAttr(photoId)}" data-audit-photo-name="${escapeAttr(rawName || "照片")}" data-audit-photo-class="${escapeAttr(rawName)}">打开对应照片</button>`;
+  }
+  const href = auditTargetHref(log);
+  if (href) {
+    const label = log.targetKind === "class" || (log.targetKind === "photos" && log.action.startsWith("photo.upload"))
+      ? "前往对应类"
+      : log.targetKind === "photos" ? "打开对应照片" : log.targetKind === "share" ? "前往分享链接" : log.targetKind === "user" ? "前往用户管理" : "前往角色管理";
+    return `<a class="audit-detail" href="${escapeAttr(href)}" data-nav>${escapeHtml(label)}</a>`;
+  }
+  return `<span class="audit-detail">${escapeHtml(log.targetKind === "photos" ? `${Number(log.targetCount || 1)} 张照片` : "操作已记录")}</span>`;
 }
 
 function auditActionName(action) {
@@ -1913,6 +2353,7 @@ function auditActionName(action) {
     "class.update": "修改类",
     "class.delete": "删除类",
     "photo.upload": "上传照片",
+    "photo.upload.deduplicated": "上传并复用照片",
     "photo.delete": "删除照片",
     "selfie.search": "自拍识别",
     "saved.add": "另存内容",
@@ -1936,6 +2377,7 @@ function auditActionName(action) {
     "class.update": "Updated class",
     "class.delete": "Deleted class",
     "photo.upload": "Uploaded photos",
+    "photo.upload.deduplicated": "Uploaded deduplicated photos",
     "photo.delete": "Deleted photos",
     "selfie.search": "Selfie search",
     "saved.add": "Saved content",
@@ -2019,7 +2461,7 @@ async function renderAdminClassDetail(classId) {
     one(".page-head p").textContent = `${photos.length} 张照片 · ${formatBytes(item.sizeBytes)} · 上传者 ${item.ownerName}`;
     byId("admin-class-detail").className = "";
     byId("admin-class-detail").innerHTML = `${Card(`<div class="page-actions">
-      <label class="button primary">${icon("upload")}上传照片<input id="admin-photo-upload" type="file" accept="image/*" multiple hidden></label>
+      <label class="button primary">${icon("upload")}上传照片<input id="admin-photo-upload" type="file" accept="image/*,.dng,image/dng,image/x-adobe-dng" multiple hidden></label>
       ${Button("重试未索引", { iconName: "history", attrs: "data-retry-ingest" })}
       ${Button("全选", { attrs: "data-select-all-admin" })}
       ${Button("删除所选", { iconName: "trash", tone: "danger", attrs: "data-delete-selected-admin" })}
@@ -2261,17 +2703,20 @@ function confirmAction(title, description, action, destructive = false) {
 
 function closeDialog() {
   if (!modalRoot.innerHTML) return;
+  const focusTarget = state.dialogFocus?.isConnected ? state.dialogFocus : null;
   modalRoot.innerHTML = "";
+  focusTarget?.focus?.({ preventScroll: true });
   unlockPageScroll();
-  state.dialogFocus?.focus?.();
   state.dialogFocus = null;
 }
 
 let lockedScrollY = 0;
+let lockedScrollX = 0;
 
 function lockPageScroll() {
   if (document.body.classList.contains("modal-open")) return;
-  lockedScrollY = window.scrollY;
+  lockedScrollX = window.scrollX;
+  lockedScrollY = window.scrollY || document.scrollingElement?.scrollTop || 0;
   document.body.classList.add("modal-open");
   Object.assign(document.body.style, {
     position: "fixed",
@@ -2286,7 +2731,12 @@ function unlockPageScroll() {
   if (!document.body.classList.contains("modal-open")) return;
   document.body.classList.remove("modal-open");
   Object.assign(document.body.style, { position: "", top: "", left: "", right: "", width: "" });
-  window.scrollTo(0, lockedScrollY);
+  const root = document.documentElement;
+  const previousBehavior = root.style.scrollBehavior;
+  root.style.scrollBehavior = "auto";
+  window.scrollTo(lockedScrollX, lockedScrollY);
+  if (document.scrollingElement) document.scrollingElement.scrollTop = lockedScrollY;
+  root.style.scrollBehavior = previousBehavior;
 }
 
 function toast(message, error = false) {
@@ -2739,4 +3189,7 @@ applyTheme(localStorage.getItem("aryuki-photo-theme")
   || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light"));
 watchLocale();
 await loadUser();
+try { await syncLocalSearchHistory(); } catch {
+  // Keep local records and retry after the next successful Auth Center session load.
+}
 await renderRoute();

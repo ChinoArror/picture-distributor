@@ -11,6 +11,6 @@ export function shortId(prefix) {
 }
 
 export async function contentHashId(blob, digest = crypto.subtle.digest.bind(crypto.subtle)) {
-  const bytes = new Uint8Array(await digest("MD5", await blob.arrayBuffer()));
+  const bytes = new Uint8Array(await digest("SHA-256", await blob.arrayBuffer()));
   return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
 }

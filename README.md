@@ -45,10 +45,10 @@ model and its upload-usage administration.
 | `/account` | Identity, Auth Center binding, theme/background settings, and Bing daily background mode |
 | `/admin` | System overview |
 | `/admin/classes` | All classes, owners, counts, bytes, visibility, photo expansion, and force deletion |
-| `/admin/uploads` | Upload usage by user, daily filtering, processing status, file bytes, and the Images processing switch |
+| `/admin/uploads` | Upload usage by user, daily filtering, processing status, file bytes, and the Images processing switch; each user card keeps its four metrics and View action on one row |
 | `/admin/users` | Users, stable identity, role assignment, effective permission, and usage |
 | `/admin/roles` | Role CRUD, default role, access mode, and quota |
-| `/admin/audit` | Actions grouped by user, including target, UUID, IP, country code, and sensitivity |
+| `/admin/audit` | Actions grouped by user, including target, UUID, optional IP display, country code, sensitivity, and in-place photo preview |
 
 The root route redirects to `/home`. Static assets use SPA fallback, so direct
 navigation to any client route is supported.
@@ -63,8 +63,9 @@ navigation to any client route is supported.
 - Recent searches close when the user clicks outside the search surface.
 - On submission, the wordmark and search box transition into the compact result
   header. Result scrolling keeps only the top header visible.
-- Search, storage, history, and result galleries request thumbnail URLs.
-  Lightbox preview and download request the original.
+- Search, storage, history, and result galleries request thumbnail URLs. The
+  lightbox also starts with the thumbnail; its **View original** action upgrades
+  only the image area to the preview asset, while download requests the original.
 
 Supported search syntax:
 
@@ -98,7 +99,9 @@ are aliases because the only searchable field is the class name.
 ### Galleries and dialogs
 
 - Filenames are not rendered below gallery thumbnails.
-- Clicking a thumbnail opens an original-image lightbox.
+- Clicking a thumbnail opens the shared full-screen lightbox without navigating
+  away. It starts with the thumbnail, upgrades to the preview on demand, and
+  reserves the original for download.
 - When available, the lightbox shows image size, dimensions, camera, capture
   time, exposure, aperture, ISO, and focal length.
 - Downloading or saving more than five photos requires confirmation.
@@ -214,7 +217,9 @@ Quota uses decimal gigabytes:
 - `roles.quota_bytes` is the limit.
 - `app_users.storage_used_bytes` is the maintained usage.
 - A quota of `0` means unlimited.
-- Only original bytes currently owned by the user are charged.
+- New SHA-256 assets charge the physical owner for the original, preview, and
+  thumbnail bytes actually stored. Historical rows retain their legacy
+  accounting until they are explicitly migrated.
 - Saved pointers, share references, selfie inputs, and Bing backgrounds do not
   count as duplicated photo storage.
 - Upload reservation is atomic in D1 and fails before storage is committed when
@@ -236,10 +241,12 @@ while active.
 - Class visibility updates are local SPA state updates and do not require a full
   page reload.
 
-Uploads accept at most 100 photos per request and 25 MiB per photo. The Worker
+Uploads accept at most 100 photos per request. Standard photos are limited to
+25 MiB each; Apple ProRAW DNG files are limited to 90 MiB each. The Worker
 checks the byte signature instead of trusting the filename or declared MIME
-type. JPEG, PNG, WebP, GIF, AVIF, HEIC, and HEIF are accepted; active SVG input
-is rejected.
+type. JPEG, PNG, WebP, GIF, AVIF, HEIC, HEIF, and Apple ProRAW DNG are accepted;
+active SVG input is rejected. A DNG upload must contain the display-ready JPEG
+preview written by Apple Camera.
 
 `photos.original_name` and the upload log use the browser-provided `File.name`.
 This normally preserves the filename exposed by the device photo picker. A
@@ -266,8 +273,9 @@ The random body is 96 bits. Common prefixes include `u_`, `c_`, `p_`, `task_`,
 `hist_`, `bg_`, `save_`, `link_`, `role_`, `job_`, `audit_`, `up_`, and `ses_`.
 `c_past000000000000` is the single fixed legacy migration exception.
 
-Every new photo also receives a fixed content ID: the lowercase 32-character
-hexadecimal MD5 digest of the original bytes. The same content ID is used in
+Every upload accepted after migration `0008` receives a fixed content ID: the
+lowercase 64-character hexadecimal SHA-256 digest of the untouched original
+bytes. The same content ID is used in
 all three stored filenames:
 
 ```text
@@ -287,36 +295,53 @@ backgrounds/<user-id>/<background-id>-original.<extension>
 backgrounds/<user-id>/<background-id>-cropped.<extension>
 ```
 
-`photos.r2_key` and `photo_upload_records` remain authoritative. Existing
-objects retain their historical keys and filenames; this change does not rename
-or move them. MD5 is only a storage content ID, never a password, session, or
-authorization primitive.
+`photo_assets` is authoritative for new physical object keys; `photos.r2_key`
+remains authoritative for historical rows. Existing objects retain their
+historical keys and filenames: migration `0008` neither renames nor moves them.
+SHA-256 is a content identity and deduplication key, not an authorization
+decision.
+
+The first upload of a SHA-256 asset keeps the existing R2 directory convention
+and stores all three objects below that first class ID. A later byte-identical
+upload creates a new logical `photos` row in the requested class but points to
+the existing `photo_assets` row. It therefore appears independently in My
+Classes and All/Managed Classes while the physical R2 object remains under the
+first class folder. Every image route authorizes the logical photo/class/share
+before resolving the physical asset key.
 
 ## Three-tier image processing and delivery
 
 This is the implemented behavior as of this repository state:
 
-1. The upload request validates the image and stores the original.
+1. The upload request validates the image, hashes the complete untouched bytes
+   with SHA-256, and atomically claims or reuses a `photo_assets` row.
 2. It always writes one `photo_upload_records` row with uploader snapshots,
    filenames, keys, original bytes, total bytes, time, and processing state.
-   Original naming is always `p_or_<md5>.<extension>`, even when Images
+   Original naming is always `p_or_<sha256>.<extension>`, even when Images
    processing is disabled.
 3. When Images processing is enabled, `photo.variants` is sent to
    `INGEST_QUEUE`. The consumer creates a width-1600 quality-84 WebP preview and
-   a width-520 quality-74 WebP thumbnail.
-4. Queue state is `queued`, `processing`, `completed`, `decline`, or `error`.
+   a width-520 quality-74 WebP thumbnail. For ProRAW, the untouched DNG remains
+   the original while its embedded JPEG preview is used for variants and face
+   indexing.
+4. Images queue state is `queued`, `processing`, `completed`, `decline`, or `error`.
    Disabling processing makes new records `decline`; transform failures become
-   `error`.
+   `error`. Facial recognition has its own state and error detail. The admin UI
+   reports failures as `Images error` or `Facial recognition error`.
 5. `/api/photos/:id/thumbnail` and `/api/photos/:id/preview` authorize the
    current request before an internal Edge Cache lookup. The outward response
    is always `private, no-store`.
 6. Edge Cache contains only derivative bytes, never a user/session decision.
    A cached derivative cannot bypass a later permission or visibility check.
-7. If a derivative is unavailable, the authorized original is returned.
-   `/api/photos/:id/file` always returns the original and supports byte ranges.
+7. If a derivative is unavailable, a ProRAW request returns its embedded JPEG;
+   other formats return the authorized original. `/api/photos/:id/file` always
+   returns the untouched original and supports byte ranges.
 8. Public-share thumbnails repeat the active-link, password-session, owner, and
    selected-content checks before the same private derivative path is used.
-9. Physical deletion removes original, preview, and thumbnail objects.
+9. A duplicate upload is displayed as `deduplicated`, has `occupied_bytes=0`,
+   and is annotated as adding no storage. The upload record still reports the
+   original and total asset size for auditing.
+10. Physical deletion removes original, preview, and thumbnail objects.
    Pointer-based ownership transfer retains all three because the photo remains
    valid.
 
@@ -325,9 +350,28 @@ their R2 objects or claiming a transformation. They continue to use the
 authorized-original fallback. A future bounded backfill may generate their
 derivatives, but it must not change any read, save, edit, or share permission.
 
-Only original bytes participate in the user role quota. Derivative bytes are
-system usage recorded in the upload log and administrator totals; they are not
-silently charged to the uploader.
+For new SHA-256 assets, original and generated derivative bytes participate in
+the physical owner's role quota and `storage_used_bytes`. Deduplicated logical
+photos consume no additional bytes.
+
+### Deduplication is not Save to mine
+
+These are deliberately separate chains:
+
+- upload deduplication creates another logical photo in another class while
+  reusing one physical asset;
+- Save to mine creates `saved_classes` or `saved_photos` pointers in a user's
+  library and does not create another uploaded photo;
+- deduplication ownership promotion is ordered by upload records; saved-content
+  ownership protection is ordered by save pointers. Neither table substitutes
+  for the other.
+
+When the physical source photo is normally deleted and another logical upload
+still references the asset, the earliest valid upload record becomes the
+physical owner. Its state changes from `deduplicated` to `completed`, its
+`occupied_bytes` becomes the asset total, and the former owner is released.
+The R2 key is unchanged. Administrator force deletion is the explicit exception:
+it removes the asset and every logical reference regardless of either chain.
 
 ## Save pointers and deletion semantics
 
@@ -425,13 +469,18 @@ The administrator console provides:
 - user-to-role assignment and effective quota/usage;
 - role creation, editing, deletion, ordering, and default-role selection;
 - upload usage grouped by uploader, with day-accurate date filtering, overall
-  totals, original/derivative bytes, filenames, and queue state;
+  totals, original/derivative/occupied bytes, filenames, detailed Images and
+  facial-recognition errors, and `deduplicated` promotion state; each uploader
+  card keeps total uploads, processed count, reused count, occupied bytes, and
+  the View action in one responsive row;
 - an administrator-only Images processing switch; disabling it records new
   uploads as `decline`, while failures are retained as `error`;
 - failed face-ingest retry;
 - resumable legacy R2 rekeying;
 - force deletion of a class or photo;
-- audit records grouped by user.
+- audit records grouped by user; IP addresses are hidden until the administrator
+  enables the display switch, and live photo targets open in the shared
+  full-screen lightbox while `/admin/audit` remains active.
 
 Audit writes are queued after successful auditable requests. A record contains
 the local user ID, stable Auth Center UUID, action, IP, two-letter country code,
@@ -447,8 +496,9 @@ names may be truncated on small screens but remain copyable in full.
 | `app_users` | Stable Auth Center binding, profile, role, administrator flag, and charged usage |
 | `app_sessions` | Opaque application sessions |
 | `photo_classes` | Class name, description, owner, visibility, and deletion state |
-| `photos` | R2 key, owner, class, bytes, metadata, Facebody entity, indexing, and deletion state |
-| `photo_upload_records` | Immutable upload/uploader snapshots, content ID, three object keys, byte totals, timestamps, and Images queue state |
+| `photo_assets` | SHA-256 physical identity, unchanged R2 keys, physical owner, byte totals, variant and facial-processing state |
+| `photos` | Logical class membership, owner, optional asset reference, display metadata, indexing, and deletion state |
+| `photo_upload_records` | Upload/uploader snapshots, content ID, three object keys, total/occupied bytes, deduplication flag, timestamps, and Images/facial states |
 | `image_processing_settings` | Singleton administrator-controlled Images processing switch |
 | `saved_classes` | User-to-class save pointers |
 | `saved_photos` | User-to-photo save pointers |
@@ -519,6 +569,7 @@ GET|PATCH|DELETE   /api/share-links/:id
 GET                /api/public/shares/:slug
 POST               /api/public/shares/:slug/unlock
 GET                /api/public/shares/:slug/photos/:photoId/file
+GET                /api/public/shares/:slug/photos/:photoId/preview
 GET                /api/public/shares/:slug/photos/:photoId/thumbnail
 ```
 
@@ -559,6 +610,7 @@ worker/
   index.js            fetch, API, queue, Cron, authorization, storage
   lib/
     alibaba.js        Facebody integration
+    dng.js            ProRAW/DNG detection and embedded-JPEG extraction
     ids.js            96-bit typed IDs
     image-metadata.js safe header/EXIF extraction
     passwords.js      share password hash/encryption
@@ -569,8 +621,9 @@ design-research/      reference and visual QA screenshots
 wrangler.toml         Worker routes, bindings, queues, and Cron
 ```
 
-Local output, tests, build/deployment caches, environment files, credentials,
-and secret files are ignored by `.gitignore`.
+Local output, tests, Playwright reports/results, temporary directories,
+build/deployment caches, environment files, credentials, and secret files or
+directories are ignored by `.gitignore`.
 
 ## Cloudflare bindings and configuration
 
@@ -676,6 +729,9 @@ Migration history:
 | `0004_background_share_audit.sql` | Adds background mode, encrypted share-password display material, and audit logs |
 | `0005_photo_metadata_audit_targets_email.sql` | Adds email, photo metadata, and audit target details |
 | `0006_image_variants_upload_records.sql` | Adds the Images switch and upload/variant usage records; legacy photos are logged as `decline` without moving objects |
+| `0007_anonymous_local_history.sql` | Keeps anonymous history client-side and makes server search ownership nullable for cleanup |
+| `0008_sha256_photo_assets.sql` | Adds SHA-256 physical assets, logical-photo references, occupied-byte accounting, deduplication state, and separate facial status without changing old names or R2 keys |
+| `0009_photo_asset_concurrency.sql` | Prevents two concurrent byte-identical requests from creating duplicate active photos in the same class |
 
 Important upgrade check: the fresh schema supports `own_read`. An existing
 database originally created by migration `0001` may still have the older
@@ -709,7 +765,7 @@ npm run check
 The `node:test` suite currently covers:
 
 - typed 96-bit IDs;
-- deterministic lowercase MD5 photo content IDs;
+- deterministic lowercase SHA-256 photo content IDs and asset references;
 - server and browser search syntax;
 - English translations and dynamic counts;
 - image metadata signatures;

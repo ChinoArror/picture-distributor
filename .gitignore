@@ -5,7 +5,12 @@ node_modules/
 .pnpm-store/
 dist/
 build/
+out/
 coverage/
+playwright-report/
+test-results/
+tmp/
+.tmp/
 *.tsbuildinfo
 .DS_Store
 Thumbs.db

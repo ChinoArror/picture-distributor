@@ -1,3 +1,5 @@
+import { isDngContentType, readDngJpegPreview } from "./dng.js";
+
 export async function ingestFace(photo, env) {
   const entityId = buildEntityId(photo.id);
   const dbName = env.ALIBABA_DB_NAME || "default";
@@ -48,7 +50,14 @@ function buildEntityId(photoId) {
 async function prepareImageUrl(r2Key, env) {
   const object = await env.PHOTO_BUCKET.get(r2Key);
   if (!object) throw new Error(`R2 object ${r2Key} was not found`);
-  const contentType = object.httpMetadata?.contentType || "application/octet-stream";
+  let contentType = object.httpMetadata?.contentType || "application/octet-stream";
+  let body = object.body;
+  if (isDngContentType(contentType, r2Key)) {
+    await object.body.cancel();
+    const preview = await readDngJpegPreview(env.PHOTO_BUCKET, r2Key, 20 * 1024 * 1024, object.size);
+    contentType = "image/jpeg";
+    body = preview.stream();
+  }
   const extension = extensionFor(contentType, r2Key);
   const sts = await getStsToken(env);
   const objectKey = `${env.ALIBABA_ACCESS_KEY_ID}/${crypto.randomUUID()}/image.${extension}`;
@@ -57,7 +66,7 @@ async function prepareImageUrl(r2Key, env) {
     accessKeyId: sts.accessKeyId,
     accessKeySecret: sts.accessKeySecret,
     securityToken: sts.securityToken,
-    body: object.body,
+    body,
     contentType,
     objectKey,
   });
